@@ -64,8 +64,14 @@
   var pitchSign = 1;              // +1 when localEulerAngles.x == -kam (Unity MouseLook standard)
   var _mlDebugLogged = {};
 
+  // God Mode state (gc.disableDamage @0x12C + 24-byte ObscuredFloat currentHp @0xEC snapshot)
+  var _spawnHpGcVal = 0;
+  var _spawnHpWords = null;       // 6 x i32 genuine ObscuredFloat snapshot from spawn/max HP
+  var _spawnHpFake = 0;
+  var _godAppliedGcVal = 0;
+
   // ============================================================
-  // CONFIG (Buildnow.gg structure + localStorage persistence)
+  // CONFIG (Buildnow.gg / Poxel structure + localStorage persistence)
   // ============================================================
   var espConfig = {
     enabled: true,
@@ -105,11 +111,22 @@
     fovsize: 150                           // px radius around crosshair
   };
 
+  var exploitConfig = {
+    godMode: false,                        // toggled with "G" key or Menu -> Player tab
+    toggleKey: "g",
+    noKnockback: true,                     // block explosion/bullet pushback while in God Mode
+    antiInfect: true                       // block zombie infection RPC while in God Mode
+  };
+
   var CONFIG_KEY = "pw_esp_v2_menu_config";
 
   function saveConfig() {
     try {
-      localStorage.setItem(CONFIG_KEY, JSON.stringify({ esp: espConfig, aim: aimConfig }));
+      localStorage.setItem(CONFIG_KEY, JSON.stringify({
+        esp: espConfig,
+        aim: aimConfig,
+        exploit: exploitConfig
+      }));
     } catch(e) {}
   }
 
@@ -120,6 +137,7 @@
       var saved = JSON.parse(raw);
       if (saved.esp) for (var k in saved.esp) if (k in espConfig) espConfig[k] = saved.esp[k];
       if (saved.aim) for (var j in saved.aim) if (j in aimConfig) aimConfig[j] = saved.aim[j];
+      if (saved.exploit) for (var m in saved.exploit) if (m in exploitConfig) exploitConfig[m] = saved.exploit[m];
       return true;
     } catch(e) { return false; }
   }
@@ -139,11 +157,24 @@
   var menuContainer = null;
   var activeTab = "Visuals";
 
+  function isInGameChatOpen() {
+    try {
+      if (!localGcPtr || localGcPtr.val() === 0) return false;
+      var rmmW = localGcPtr.readField(0x138, "i32"); // gc.rmm -> iu
+      if (!rmmW || rmmW.val() === 0) return false;
+      return (rmmW.readField(0x2C4, "i32").val() & 0xff) !== 0; // iu.IsChat @0x2C4
+    } catch(e) {
+      return false;
+    }
+  }
+
   function isTypingInInput(e) {
     var el = e && e.target;
-    if (!el || !el.tagName) return false;
-    var tag = el.tagName.toUpperCase();
-    return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || !!el.isContentEditable;
+    if (el && el.tagName) {
+      var tag = el.tagName.toUpperCase();
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || !!el.isContentEditable) return true;
+    }
+    return isInGameChatOpen();
   }
 
   window.addEventListener("keydown", function(e) {
@@ -169,6 +200,13 @@
       saveConfig();
       console.log("[PW AIM] " + (aimConfig.aimbot ? "ON" : "OFF"));
       showToast("Aimbot: " + (aimConfig.aimbot ? "ON" : "OFF"));
+      if (menuOpen) renderPanel();
+    }
+    if (e.key === exploitConfig.toggleKey || e.code === ("Key" + String(exploitConfig.toggleKey).toUpperCase())) {
+      exploitConfig.godMode = !exploitConfig.godMode;
+      saveConfig();
+      console.log("[PW GOD] " + (exploitConfig.godMode ? "ON" : "OFF"));
+      showToast("God Mode: " + (exploitConfig.godMode ? "ON" : "OFF"));
       if (menuOpen) renderPanel();
     }
   }, true);
@@ -213,7 +251,9 @@
   // MENU — Buildnow.gg style with Visuals / Aimbot / Settings tabs
   // ============================================================
   function cfgObj(cfg) {
-    return cfg === "aim" ? aimConfig : espConfig;
+    if (cfg === "aim") return aimConfig;
+    if (cfg === "exploit") return exploitConfig;
+    return espConfig;
   }
 
   function fmtVal(v) {
@@ -374,6 +414,7 @@
         '<div class="hm-tabs">' +
           '<div class="hm-tab active" data-tab="Visuals">Visuals</div>' +
           '<div class="hm-tab" data-tab="Aimbot">Aimbot</div>' +
+          '<div class="hm-tab" data-tab="Player">Player</div>' +
           '<div class="hm-tab" data-tab="Settings">Settings</div>' +
         '</div>' +
         '<div class="hm-body" id="hm-body"></div>' +
@@ -470,6 +511,14 @@
           toggleRow("aim", "fovcircle", "FOV Circle") +
           sliderRow("aim", "fovsize", "FOV Size", 20, 400, 5) +
         '</div>';
+    } else if (activeTab === "Player") {
+      body.innerHTML =
+        '<div class="hm-group">' +
+          '<div class="hm-group-title">Protection</div>' +
+          toggleRow("exploit", "godMode", "God Mode (" + String(exploitConfig.toggleKey).toUpperCase() + ")") +
+          toggleRow("exploit", "noKnockback", "No Hit / Blast Knockback") +
+          toggleRow("exploit", "antiInfect", "Anti-Zombie Infect") +
+        '</div>';
     } else if (activeTab === "Settings") {
       var mlStatus = (mlXY ? "XY " : "") + (mlX ? "X " : "") + (mlY ? "Y" : "");
       if (!mlStatus) mlStatus = localFpPtr ? "FP Fallback" : "Waiting...";
@@ -478,6 +527,7 @@
           '<div class="hm-group-title">Hotkeys</div>' +
           keyRow("esp", "menuKey", "Menu Key") +
           keyRow("aim", "toggleKey", "Aimbot Toggle Key") +
+          keyRow("exploit", "toggleKey", "God Mode Toggle Key") +
           selectRow("esp", "toggleKey", "ESP Toggle Key", ["Insert", "Delete", "End", "Home", "F1", "F2", "F3"]) +
         '</div>' +
         '<div class="hm-group">' +
@@ -489,6 +539,7 @@
           '<div class="hm-group-title">Info</div>' +
           '<div class="hm-row"><span class="hm-label">Players Tracked</span><span class="hm-label" id="hm-player-count" style="color:rgba(255,255,255,0.4)">' + Object.keys(playerMap).length + '</span></div>' +
           '<div class="hm-row"><span class="hm-label">Aim Controller</span><span class="hm-label" id="hm-ml-status" style="color:rgba(255,255,255,0.4)">' + mlStatus + '</span></div>' +
+          '<div class="hm-row"><span class="hm-label">God Mode</span><span class="hm-label" style="color:' + (exploitConfig.godMode ? '#52e078' : 'rgba(255,255,255,0.4)') + '">' + (exploitConfig.godMode ? 'ACTIVE' : 'OFF') + '</span></div>' +
         '</div>';
     }
 
@@ -1114,7 +1165,37 @@
     }
 
     // ============================================================
-    // gc.Update — track remote players & capture local player
+    // Local ownership helpers (used by God Mode + Aimbot hooks)
+    // ============================================================
+    function isLocalGc(gcPtr) {
+      if (!gcPtr || gcPtr.val() === 0) return false;
+      if (localGcPtr && localGcPtr.val() !== 0) {
+        return gcPtr.val() === localGcPtr.val();
+      }
+      try {
+        var pv = ctx.call("Photon.Pun.MonoBehaviourPun", "get_photonView", [gcPtr]);
+        if (pv && pv.val() !== 0 && ctx.call("Photon.Pun.PhotonView", "get_IsMine", [pv]).val() === 1) {
+          localGcPtr = gcPtr;
+          return true;
+        }
+      } catch(e) {}
+      return false;
+    }
+
+    function isLocalGd(gdPtr) {
+      if (!gdPtr || gdPtr.val() === 0) return false;
+      try {
+        if ((gdPtr.readField(0xC0, "i32").val() & 0xff) !== 0) return true; // gd.playerIsOurs @0xC0
+        var gcW = gdPtr.readField(0xA8, "i32"); // gd.playerDamage @0xA8
+        if (gcW && gcW.val() !== 0 && localGcPtr && gcW.val() === localGcPtr.val()) return true;
+      } catch(e) {}
+      return false;
+    }
+
+    // ============================================================
+    // gc.Update — track remote players, capture local player, &
+    // maintain God Mode (gc.disableDamage @0x12C + genuine 24-byte
+    // ObscuredFloat currentHp @0xEC..0x100 snapshot restore)
     // ============================================================
     ctx.hookPrefix({
       typeName: "gc", methodName: "Update", params: ["i32", "i32"]
@@ -1126,7 +1207,8 @@
         if (!pvPtr || pvPtr.val() === 0) return;
         var isMine = ctx.call("Photon.Pun.PhotonView", "get_IsMine", [pvPtr]).val() === 1;
         if (isMine) {
-          if (!localGcPtr || localGcPtr.val() !== thisPtr.val()) {
+          var myVal = thisPtr.val();
+          if (!localGcPtr || localGcPtr.val() !== myVal) {
             localGcPtr = thisPtr;
             localFpPtr = null;
             localRootTr = null;
@@ -1138,6 +1220,55 @@
             var fpW = thisPtr.readField(0x140, "i32"); // gc.kdh -> fp (FPScontroller)
             if (fpW && fpW.val() !== 0) localFpPtr = fpW;
           } catch(eFp) {}
+
+          // Snapshot genuine ObscuredFloat currentHp (@0xEC..0x100, 6 x i32) at spawn
+          // so restoring it never trips ACTk ObscuredCheatingDetector.
+          try {
+            var deadNow = (thisPtr.readField(0x134, "i32").val() & 0xff) !== 0;
+            if (!deadNow) {
+              var hpInited = (thisPtr.readField(0xF8, "i32").val() & 0xff) !== 0; // 0xEC + 0x0C (inited)
+              if (hpInited) {
+                var fakeAct = (thisPtr.readField(0x100, "i32").val() & 0xff) !== 0; // 0xEC + 0x14
+                var curFake = thisPtr.readField(0xFC, "f32").val();                 // 0xEC + 0x10
+                if (_spawnHpGcVal !== myVal || !_spawnHpWords || (fakeAct && curFake > _spawnHpFake)) {
+                  _spawnHpGcVal = myVal;
+                  _spawnHpFake = fakeAct ? curFake : 100;
+                  _spawnHpWords = [
+                    thisPtr.readField(0xEC, "i32").val(),
+                    thisPtr.readField(0xF0, "i32").val(),
+                    thisPtr.readField(0xF4, "i32").val(),
+                    thisPtr.readField(0xF8, "i32").val(),
+                    thisPtr.readField(0xFC, "i32").val(),
+                    thisPtr.readField(0x100, "i32").val()
+                  ];
+                }
+              }
+
+              if (exploitConfig.godMode) {
+                var dd = thisPtr.readField(0x12C, "i32").val(); // gc.disableDamage @0x12C
+                if ((dd & 0xff) !== 1) {
+                  thisPtr.writeField(0x12C, "i32", (dd & ~0xff) | 1);
+                }
+                _godAppliedGcVal = myVal;
+
+                if (_spawnHpGcVal === myVal && _spawnHpWords) {
+                  if (thisPtr.readField(0xEC, "i32").val() !== _spawnHpWords[0] ||
+                      thisPtr.readField(0xF0, "i32").val() !== _spawnHpWords[1]) {
+                    thisPtr.writeField(0xEC, "i32", _spawnHpWords[0]);
+                    thisPtr.writeField(0xF0, "i32", _spawnHpWords[1]);
+                    thisPtr.writeField(0xF4, "i32", _spawnHpWords[2]);
+                    thisPtr.writeField(0xF8, "i32", _spawnHpWords[3]);
+                    thisPtr.writeField(0xFC, "i32", _spawnHpWords[4]);
+                    thisPtr.writeField(0x100, "i32", _spawnHpWords[5]);
+                  }
+                }
+              } else if (_godAppliedGcVal === myVal) {
+                var ddOff = thisPtr.readField(0x12C, "i32").val();
+                thisPtr.writeField(0x12C, "i32", ddOff & ~0xff);
+                _godAppliedGcVal = 0;
+              }
+            }
+          } catch(eGod) {}
           return;
         }
 
@@ -1167,6 +1298,104 @@
         };
       } catch(e) {}
     });
+
+    // ============================================================
+    // GOD MODE HOOKS — Pixel Warfare dump.cs verified signatures
+    //   Only cancels damage/death on the LOCAL player (isLocalGc),
+    //   leaving damage dealt to remote enemies 100% untouched.
+    // ============================================================
+    // 1) [PunRPC] gc.нараняване (RVA 0x5C9D) — incoming network weapon/blast damage
+    try {
+      ctx.hookPrefix({
+        typeName: "gc",
+        methodName: "нараняване",
+        params: ["i32", "f32", "i32", "i32", "f32", "i32", "i32", "i32", "i32", "i32"]
+      }, function(thisPtr) {
+        try {
+          if (exploitConfig.godMode && isLocalGc(thisPtr)) return false;
+        } catch(e) {}
+      });
+    } catch(e) {}
+
+    // 2) gc.Kill + obfuscator aliases (int weaponid) — instant death (lava, void, drowning, traps)
+    ["Kill", "cne", "bil", "fax", "bpc"].forEach(function(killMethod) {
+      try {
+        ctx.hookPrefix({
+          typeName: "gc",
+          methodName: killMethod,
+          params: ["i32", "i32", "i32"]
+        }, function(thisPtr) {
+          try {
+            if (exploitConfig.godMode && isLocalGc(thisPtr)) return false;
+          } catch(e) {}
+        });
+      } catch(e) {}
+    });
+
+    // 3) gc.chc (RVA 0x5C97, float dmg) — fall / drowning / environmental damage
+    try {
+      ctx.hookPrefix({
+        typeName: "gc",
+        methodName: "chc",
+        params: ["i32", "f32", "i32"]
+      }, function(thisPtr) {
+        try {
+          if (exploitConfig.godMode && isLocalGc(thisPtr)) return false;
+        } catch(e) {}
+      });
+    } catch(e) {}
+
+    // 4) gc.che & gc.mlk (float dmg, Vector3 dir, int weaponid) — self rocket/grenade splash
+    ["che", "mlk"].forEach(function(expMethod) {
+      try {
+        ctx.hookPrefix({
+          typeName: "gc",
+          methodName: expMethod,
+          params: ["i32", "f32", "i32", "i32", "i32"]
+        }, function(thisPtr) {
+          try {
+            if (exploitConfig.godMode && isLocalGc(thisPtr)) return false;
+          } catch(e) {}
+        });
+      } catch(e) {}
+    });
+
+    // 5) gc.chg (RVA 0x5C87, Vector3 dir) — hit / blast knockback push
+    try {
+      ctx.hookPrefix({
+        typeName: "gc",
+        methodName: "chg",
+        params: ["i32", "i32", "i32"]
+      }, function(thisPtr) {
+        try {
+          if (exploitConfig.godMode && exploitConfig.noKnockback && isLocalGc(thisPtr)) return false;
+        } catch(e) {}
+      });
+    } catch(e) {}
+
+    // 6) [PunRPC] gd.InfectPlayer (RVA 0x5CBE, int spawnId) — zombie infection RPC
+    try {
+      ctx.hookPrefix({
+        typeName: "gd",
+        methodName: "InfectPlayer",
+        params: ["i32", "i32", "i32"]
+      }, function(thisPtr) {
+        try {
+          if (exploitConfig.godMode && exploitConfig.antiInfect && isLocalGd(thisPtr)) return false;
+        } catch(e) {}
+      });
+    } catch(e) {}
+
+    // 7) [PunRPC] PhotonRPC_redirect.Проверка (RVA 0x6810) — incoming death-check report RPC
+    try {
+      ctx.hookPrefix({
+        typeName: "PhotonRPC_redirect",
+        methodName: "Проверка",
+        params: ["i32", "i32", "i32", "i32"]
+      }, function() {
+        if (exploitConfig.godMode) return false;
+      });
+    } catch(e) {}
 
     // ============================================================
     // gd.Update — cache playerTeam @0xC8 per gc instance (for Team Check)
