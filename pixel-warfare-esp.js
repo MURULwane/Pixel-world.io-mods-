@@ -1,5 +1,6 @@
 // ==UserScript==
-// @name        PW Box ESP + Aimlock
+// @name        PW Box + Skeleton ESP + Aimlock + God Mode
+// @version     2.3.0
 // @match       *://pixelwarfare.io/*
 // @match       *://www.pixelwarfare.io/*
 // @match       *://games.crazygames.com/*/pixel-warfare/*
@@ -29,6 +30,7 @@
   var playerMap = {};
   var nameCache = {};          // actorNr -> resolved nickname (Photon NickName, once per actor)
   var teamCache = {};          // gcPtr raw -> { team: string, ts: number } from gd.playerTeam @0xC8
+  var skelCache = {};          // gcPtr raw -> { nodes: Array, links: Array, ts: number } bone cache
   var _reusableBufs = {};
   var _spanDebugOnce = false;
 
@@ -84,6 +86,9 @@
     boxHeight: 1.8,       // fallback height when hitboxes can't be read
     boxAutoHeight: true,  // resolve exact top/bottom from the real hitbox colliders
     heightAdj: 0,         // meters added to the resolved top for fine tuning
+    skeleton: true,       // Poxel-style animated bone skeleton ESP
+    skeletonThickness: 1.5,
+    skeletonColor: "#00ffff",
     tracer: true,         // line from screen bottom-center to each player's feet
     tracerThickness: 1.5,
     tracerColor: "#ff00ff",
@@ -475,6 +480,12 @@
           sliderRow("esp", "boxThickness", "Thickness", 1, 5, 1) +
           sliderRow("esp", "heightAdj", "Height Adjust", -0.3, 0.3, 0.05) +
           colorRow("esp", "boxColor", "Color") +
+        '</div>' +
+        '<div class="hm-group">' +
+          '<div class="hm-group-title">Skeleton</div>' +
+          toggleRow("esp", "skeleton", "Enable Skeleton") +
+          sliderRow("esp", "skeletonThickness", "Thickness", 0.5, 5, 0.5) +
+          colorRow("esp", "skeletonColor", "Color") +
         '</div>' +
         '<div class="hm-group">' +
           '<div class="hm-group-title">Tracers</div>' +
@@ -953,6 +964,358 @@
     ctx2d.beginPath(); ctx2d.moveTo(x, y + h); ctx2d.lineTo(x + cl, y + h); ctx2d.stroke();
     ctx2d.beginPath(); ctx2d.moveTo(x + w, y + h); ctx2d.lineTo(x + w - cl, y + h); ctx2d.stroke();
     ctx2d.beginPath(); ctx2d.moveTo(x + w, y + h); ctx2d.lineTo(x + w, y + h - cl); ctx2d.stroke();
+  }
+
+  // ============================================================
+  // Skeleton ESP — Poxel BONE_LINKS + cached Transform pattern
+  // adapted strictly to Pixel Warfare's gc rig in dump.cs:
+  //   Tier 1: gc.DeadBody*Pos Transform fields (@0x40..0x68)
+  //   Tier 2: gc.hitBoxes (@0xE8) Collider Transform hierarchy
+  // ============================================================
+  var PW_BONE_OFFSETS = [
+    0x40, // 0: DeadBodyHeadPos       (Head)
+    0x44, // 1: DeadBodyTopPos        (Spine2 / Upper Chest)
+    0x48, // 2: DeadBodyBottomPos     (Spine1 / Pelvis)
+    0x4C, // 3: DeadBodyLLegTopPos    (Left Hip)
+    0x50, // 4: DeadBodyLLegBottomPos (Left Foot / Shin)
+    0x54, // 5: DeadBodyRLegTopPos    (Right Hip)
+    0x58, // 6: DeadBodyRLegBottomPos (Right Foot / Shin)
+    0x5C, // 7: DeadBodyLArmTopPos    (Left Shoulder)
+    0x60, // 8: DeadBodyLArmBottomPos (Left Hand / Forearm)
+    0x64, // 9: DeadBodyRArmTopPos    (Right Shoulder)
+    0x68  // 10: DeadBodyRArmBottomPos (Right Hand / Forearm)
+  ];
+
+  // Exact 10-link Poxel humanoid skeleton topology
+  var PW_BONE_LINKS = [
+    [2, 1],  // Spine1 -> Spine2
+    [1, 0],  // Spine2 -> Head
+    [1, 9],  // Spine2 -> RightShoulder
+    [9, 10], // RightShoulder -> RightHand
+    [1, 7],  // Spine2 -> LeftShoulder
+    [7, 8],  // LeftShoulder -> LeftHand
+    [2, 5],  // Spine1 -> RightHip
+    [5, 6],  // RightHip -> RightFoot
+    [2, 3],  // Spine1 -> LeftHip
+    [3, 4]   // LeftHip -> LeftFoot
+  ];
+
+  var _skelDebugOnce = false;
+
+  function readBonePosInBand(trW, px, py, pz) {
+    if (!trW || trW.val() === 0) return null;
+    var pb = getTransformPosBuf(trW);
+    if (!pb) return null;
+    var bx = pb.readField(0x0, "f32").val();
+    var by = pb.readField(0x4, "f32").val();
+    var bz = pb.readField(0x8, "f32").val();
+    if (!isFinite(bx) || !isFinite(by) || !isFinite(bz)) return null;
+    if (Math.abs(bx - px) > 2.0 || Math.abs(bz - pz) > 2.0) return null;
+    if (by < py - 1.0 || by > py + 2.8) return null;
+    return { x: bx, y: by, z: bz };
+  }
+
+  function resolveSkeleton(gcPtr, rootTrPtr, px, py, pz) {
+    var gcRaw = gcPtr.val();
+    var now = Date.now();
+    var cached = skelCache[gcRaw];
+    // Poxel caching pattern: 3000ms TTL when valid, 1000ms retry when empty
+    if (cached) {
+      var ttl = cached.links.length > 0 ? 3000 : 1000;
+      if ((now - cached.ts) < ttl) return cached;
+    }
+
+    var rootAddr = (rootTrPtr && rootTrPtr.val) ? rootTrPtr.val() : 0;
+
+    // --- Tier 1: Direct gc.DeadBody*Pos Transform fields (@0x40..0x68) ---
+    try {
+      var slots = new Array(11);
+      var slotPos = new Array(11);
+      var altOffsets = { 0: 0x2C, 1: 0x30, 2: 0x34 }; // ExplosionHitTop/Middle/Bottom fallbacks
+      for (var s = 0; s < 11; s++) {
+        var tw = gcPtr.readField(PW_BONE_OFFSETS[s], "i32");
+        var tp = readBonePosInBand(tw, px, py, pz);
+        if (!tp && (s in altOffsets)) {
+          tw = gcPtr.readField(altOffsets[s], "i32");
+          tp = readBonePosInBand(tw, px, py, pz);
+        }
+        if (tp) {
+          slots[s] = tw;
+          slotPos[s] = tp;
+        } else {
+          slots[s] = null;
+          slotPos[s] = null;
+        }
+      }
+
+      // If Pelvis (2) is missing on a skin but Upper Chest (1) exists, anchor hips to (1)
+      var nodes = [];
+      var slotToNode = {};
+      var addrSeen = {};
+      for (var s2 = 0; s2 < 11; s2++) {
+        if (!slots[s2]) continue;
+        var addr = slots[s2].val();
+        if (addr in addrSeen) {
+          slotToNode[s2] = addrSeen[addr];
+        } else {
+          var idx = nodes.length;
+          nodes.push({ tr: slots[s2], col: null });
+          addrSeen[addr] = idx;
+          slotToNode[s2] = idx;
+        }
+      }
+
+      if (nodes.length >= 5) {
+        var links = [];
+        var linkSeen = {};
+        function addTier1Link(aSlot, bSlot) {
+          if (!(aSlot in slotToNode) || !(bSlot in slotToNode)) return;
+          var ia = slotToNode[aSlot], ib = slotToNode[bSlot];
+          if (ia === ib) return;
+          var pa = slotPos[aSlot], pb2 = slotPos[bSlot];
+          var ddx = pa.x - pb2.x, ddy = pa.y - pb2.y, ddz = pa.z - pb2.z;
+          var d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+          if (d2 < 0.0009 || d2 > 2.89) return; // 0.03m .. 1.7m sanity
+          var key = ia < ib ? (ia + ":" + ib) : (ib + ":" + ia);
+          if (linkSeen[key]) return;
+          linkSeen[key] = true;
+          links.push([ia, ib]);
+        }
+
+        for (var li = 0; li < PW_BONE_LINKS.length; li++) {
+          var u = PW_BONE_LINKS[li][0], v = PW_BONE_LINKS[li][1];
+          if (u === 2 && !(2 in slotToNode) && (1 in slotToNode) && v !== 1) u = 1;
+          addTier1Link(u, v);
+        }
+
+        // Extend distal limb bones (4, 6, 8, 10) to GetChild(0) if rig uses 2-bone+tip chains
+        var distalSlots = [4, 6, 8, 10];
+        for (var di = 0; di < distalSlots.length; di++) {
+          var ds = distalSlots[di];
+          if (!(ds in slotToNode)) continue;
+          try {
+            var dTr = slots[ds];
+            var cc = ctx.call("UnityEngine.Transform", "get_childCount", [dTr]);
+            if (cc && cc.val() > 0) {
+              var chTr = ctx.call("UnityEngine.Transform", "GetChild", [dTr, 0]);
+              if (chTr && chTr.val() !== 0 && !(chTr.val() in addrSeen)) {
+                var cp = readBonePosInBand(chTr, px, py, pz);
+                if (cp) {
+                  var dp = slotPos[ds];
+                  var cdx = cp.x - dp.x, cdy = cp.y - dp.y, cdz = cp.z - dp.z;
+                  var cd = Math.sqrt(cdx * cdx + cdy * cdy + cdz * cdz);
+                  if (cd >= 0.12 && cd <= 0.60) {
+                    var cIdx = nodes.length;
+                    nodes.push({ tr: chTr, col: null });
+                    addrSeen[chTr.val()] = cIdx;
+                    links.push([slotToNode[ds], cIdx]);
+                  }
+                }
+              }
+            }
+          } catch(eChild) {}
+        }
+
+        if (links.length >= 4) {
+          if (espConfig.debug && !_skelDebugOnce) {
+            _skelDebugOnce = true;
+            console.log("[PW ESP] Skeleton resolved via Tier 1 (DeadBody*Pos): nodes=" + nodes.length + ", links=" + links.length);
+          }
+          skelCache[gcRaw] = { nodes: nodes, links: links, ts: now };
+          return skelCache[gcRaw];
+        }
+      }
+    } catch(e1) {}
+
+    // --- Tier 2 Fallback: gc.hitBoxes (@0xE8) Collider Transform hierarchy ---
+    try {
+      var listW = gcPtr.readField(0xE8, "i32");
+      if (listW && listW.val() !== 0) {
+        var itemsW = listW.readField(0x8, "i32");
+        var listSize = listW.readField(0xC, "i32").val();
+        if (itemsW && itemsW.val() !== 0 && listSize > 0) {
+          var cap = itemsW.readField(0xC, "i32").val();
+          var count = Math.min(listSize, cap, 32);
+          var t2Nodes = [];
+          var t2Map = {};
+          var t2Links = [];
+          var t2EdgeSeen = {};
+
+          function ensureNode(trW, colW) {
+            var a = trW.val();
+            if (a in t2Map) {
+              var existing = t2Nodes[t2Map[a]];
+              if (colW && !existing.col) existing.col = colW;
+              return t2Map[a];
+            }
+            var ni = t2Nodes.length;
+            t2Nodes.push({ tr: trW, col: colW || null });
+            t2Map[a] = ni;
+            return ni;
+          }
+
+          function addT2Edge(ia, ib) {
+            if (ia === ib) return;
+            var k = ia < ib ? (ia + ":" + ib) : (ib + ":" + ia);
+            if (t2EdgeSeen[k]) return;
+            t2EdgeSeen[k] = true;
+            t2Links.push([ia, ib]);
+          }
+
+          var leafIndices = [];
+          var hasChildFlag = {};
+
+          for (var i = 0; i < count; i++) {
+            var hbW = itemsW.readField(0x10 + 4 * i, "i32");
+            if (!hbW || hbW.val() === 0) continue;
+            var colW = hbW.readField(0x8, "i32");
+            if (!colW || colW.val() === 0) continue;
+            var bTr = ctx.call("UnityEngine.Component", "get_transform", [colW]);
+            if (!bTr || bTr.val() === 0 || bTr.val() === rootAddr) continue;
+            if (!readBonePosInBand(bTr, px, py, pz)) continue;
+
+            var curIdx = ensureNode(bTr, colW);
+            leafIndices.push(curIdx);
+
+            // Walk Transform.get_parent up to rootTrPtr to connect limbs through spine/pelvis
+            var curTr = bTr;
+            var curNodeIdx = curIdx;
+            for (var hop = 0; hop < 4; hop++) {
+              var parTr = ctx.call("UnityEngine.Transform", "get_parent", [curTr]);
+              if (!parTr || parTr.val() === 0 || parTr.val() === rootAddr) break;
+              var parPos = readBonePosInBand(parTr, px, py, pz);
+              if (!parPos) break;
+              // Skip container transforms parked right on the root origin (feet) unless near pelvis
+              if (Math.abs(parPos.y - py) < 0.08 && hop >= 1) break;
+              var parIdx = ensureNode(parTr, null);
+              addT2Edge(parIdx, curNodeIdx);
+              hasChildFlag[parIdx] = true;
+              curTr = parTr;
+              curNodeIdx = parIdx;
+            }
+          }
+
+          // Extend leaf hitbox bones to GetChild(0) if present, else mark offset-collider tip
+          for (var li2 = 0; li2 < leafIndices.length; li2++) {
+            var lIdx = leafIndices[li2];
+            if (hasChildFlag[lIdx]) continue;
+            var lNode = t2Nodes[lIdx];
+            var extended = false;
+            try {
+              var lcc = ctx.call("UnityEngine.Transform", "get_childCount", [lNode.tr]);
+              if (lcc && lcc.val() > 0) {
+                var lch = ctx.call("UnityEngine.Transform", "GetChild", [lNode.tr, 0]);
+                if (lch && lch.val() !== 0 && !(lch.val() in t2Map)) {
+                  var lcp = readBonePosInBand(lch, px, py, pz);
+                  var lpp = readBonePosInBand(lNode.tr, px, py, pz);
+                  if (lcp && lpp) {
+                    var ldx = lcp.x - lpp.x, ldy = lcp.y - lpp.y, ldz = lcp.z - lpp.z;
+                    var ld = Math.sqrt(ldx * ldx + ldy * ldy + ldz * ldz);
+                    if (ld >= 0.12 && ld <= 0.65) {
+                      var chIdx = ensureNode(lch, null);
+                      addT2Edge(lIdx, chIdx);
+                      extended = true;
+                    }
+                  }
+                }
+              }
+            } catch(eLeaf) {}
+
+            // Blocky limb collider whose pivot is at shoulder/hip and BoxCollider extends to hand/foot
+            if (!extended && lNode.col) {
+              lNode.useColTip = true;
+            }
+          }
+
+          if (t2Links.length >= 2) {
+            if (espConfig.debug && !_skelDebugOnce) {
+              _skelDebugOnce = true;
+              console.log("[PW ESP] Skeleton resolved via Tier 2 (hitBoxes): nodes=" + t2Nodes.length + ", links=" + t2Links.length);
+            }
+            skelCache[gcRaw] = { nodes: t2Nodes, links: t2Links, ts: now };
+            return skelCache[gcRaw];
+          }
+        }
+      }
+    } catch(e2) {}
+
+    skelCache[gcRaw] = { nodes: [], links: [], ts: now };
+    return skelCache[gcRaw];
+  }
+
+  function drawSkeleton(gcPtr, rootTrPtr, px, py, pz, camPtr, color, thickness) {
+    var gcRaw = gcPtr.val();
+    var skel = resolveSkeleton(gcPtr, rootTrPtr, px, py, pz);
+    if (!skel || !skel.links || skel.links.length === 0) return;
+
+    var nLen = skel.nodes.length;
+    var proj = new Array(nLen);
+    var wBuf = getBuf("skel_w", 0x1C);
+    var colBuf = null;
+
+    for (var i = 0; i < nLen; i++) {
+      var node = skel.nodes[i];
+      if (!node.tr || node.tr.val() === 0) { delete skelCache[gcRaw]; return; }
+      var pb = getTransformPosBuf(node.tr);
+      // Poxel safety: NaN sentinel indicates destroyed Transform -> drop cache immediately
+      if (!pb) { delete skelCache[gcRaw]; return; }
+      var bx = pb.readField(0x0, "f32").val();
+      var by = pb.readField(0x4, "f32").val();
+      var bz = pb.readField(0x8, "f32").val();
+      if (!isFinite(bx) || !isFinite(by) || !isFinite(bz) ||
+          Math.abs(bx - px) > 2.0 || Math.abs(bz - pz) > 2.0 ||
+          by < py - 1.0 || by > py + 2.8) {
+        proj[i] = null;
+        continue;
+      }
+      writeVec3(wBuf, bx, by, bz);
+      var sc = worldToScreen(wBuf, camPtr);
+      proj[i] = (sc && sc.z >= 0.05) ? { sx: sc.x, sy: sc.y, wx: bx, wy: by, wz: bz, node: node } : null;
+    }
+
+    ctx2d.strokeStyle = color;
+    ctx2d.lineWidth = thickness;
+    ctx2d.lineCap = "round";
+    ctx2d.beginPath();
+    var anySeg = false;
+
+    for (var k = 0; k < skel.links.length; k++) {
+      var pa = proj[skel.links[k][0]];
+      var pb2 = proj[skel.links[k][1]];
+      if (!pa || !pb2) continue;
+      ctx2d.moveTo(pa.sx, pa.sy);
+      ctx2d.lineTo(pb2.sx, pb2.sy);
+      anySeg = true;
+    }
+
+    // Optional blocky-limb collider tip extensions in Tier 2
+    for (var m = 0; m < nLen; m++) {
+      var pm = proj[m];
+      if (!pm || !pm.node.useColTip || !pm.node.col) continue;
+      try {
+        if (!colBuf) colBuf = getBuf("skel_cb", 0x18);
+        colBuf.writeField(0x0, "f32", NaN);
+        ctx.call("UnityEngine.Collider", "get_bounds", [colBuf, pm.node.col]);
+        var cx = colBuf.readField(0x0, "f32").val();
+        if (cx !== cx) continue;
+        var cy = colBuf.readField(0x4, "f32").val();
+        var cz = colBuf.readField(0x8, "f32").val();
+        var ox = cx - pm.wx, oy = cy - pm.wy, oz = cz - pm.wz;
+        var od = Math.sqrt(ox * ox + oy * oy + oz * oz);
+        if (od >= 0.10 && od <= 0.48) {
+          writeVec3(wBuf, pm.wx + ox * 2, pm.wy + oy * 2, pm.wz + oz * 2);
+          var tipSc = worldToScreen(wBuf, camPtr);
+          if (tipSc && tipSc.z >= 0.05) {
+            ctx2d.moveTo(pm.sx, pm.sy);
+            ctx2d.lineTo(tipSc.x, tipSc.y);
+            anySeg = true;
+          }
+        }
+      } catch(eTip) {}
+    }
+
+    if (anySeg) ctx2d.stroke();
+    ctx2d.lineCap = "butt";
   }
 
   // ============================================================
@@ -1545,13 +1908,18 @@
           playerMap = {};
           nameCache = {};
           teamCache = {};
+          skelCache = {};
           return;
         }
 
         var now = Date.now();
         var staleKeys = Object.keys(playerMap);
         for (var s = 0; s < staleKeys.length; s++) {
-          if (now - playerMap[staleKeys[s]].timestamp > 500) delete playerMap[staleKeys[s]];
+          if (now - playerMap[staleKeys[s]].timestamp > 500) {
+            var stPtr = playerMap[staleKeys[s]].ptr;
+            if (stPtr && stPtr.val) delete skelCache[stPtr.val()];
+            delete playerMap[staleKeys[s]];
+          }
         }
 
         if (!espConfig.enabled && !aimConfig.aimbot) return;
@@ -1598,7 +1966,10 @@
 
             // gc.PlayerIsDead (dump.cs @0x134)
             var deadW = data.ptr.readField(0x134, "i32");
-            if (deadW && (deadW.val() & 0xff)) continue;
+            if (deadW && (deadW.val() & 0xff)) {
+              delete skelCache[data.ptr.val()];
+              continue;
+            }
 
             var trPtr = ctx.call("UnityEngine.Component", "get_transform", [data.ptr]);
             if (!trPtr || trPtr.val() === 0) continue;
@@ -1670,6 +2041,10 @@
 
               if (espConfig.box) {
                 drawCornerBox(headScreen.x, headScreen.y, feetScreen.x, feetScreen.y, espConfig.boxColor, espConfig.boxThickness, espConfig.boxWidth);
+              }
+
+              if (espConfig.skeleton) {
+                drawSkeleton(data.ptr, trPtr, px, py, pz, camPtr, espConfig.skeletonColor, espConfig.skeletonThickness);
               }
 
               if (espConfig.name) {
