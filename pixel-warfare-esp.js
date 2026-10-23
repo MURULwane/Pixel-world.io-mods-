@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        PW Box + Skeleton ESP + Aimlock + God Mode
-// @version     2.3.1
+// @version     2.3.2
 // @match       *://pixelwarfare.io/*
 // @match       *://www.pixelwarfare.io/*
 // @match       *://games.crazygames.com/*/pixel-warfare/*
@@ -1099,10 +1099,9 @@
       try {
         var chTr = gdW.readField(0x28, "i32"); // gd.Character
         if (chTr && chTr.val() !== 0) charRoot = chTr;
-        var shR = gdW.readField(0x78, "i32");  // gd.shoulderR
-        var shL = gdW.readField(0x7C, "i32");  // gd.shoulderL
-        setSlot(9, shR, 2);
-        setSlot(7, shL, 2);
+        // Only use gd.shoulderR/L as fallback if DeadBody*ArmTopPos wasn't populated
+        if (!slots[9]) setSlot(9, gdW.readField(0x78, "i32"), 1);
+        if (!slots[7]) setSlot(7, gdW.readField(0x7C, "i32"), 1);
       } catch(eGd) {}
     }
 
@@ -1126,12 +1125,10 @@
             var bPos = readBonePosInBand(cur, px, py, pz);
             if (bPos) {
               var side = detectBoneSide(nm);
-              // Spine / Head / Pelvis
-              if (low.indexOf("head") !== -1 && low.indexOf("headlook") === -1) {
-                if (low.indexOf("top") !== -1 || low.indexOf("end") !== -1) setSlot(0, cur, 5);
-                else setSlot(0, cur, 4);
-              } else if (low.indexOf("neck") !== -1) {
-                setSlot(1, cur, 4);
+              // Spine / Head / Pelvis (exclude HeadTop_End & keep Neck out of Chest slot 1)
+              if (low.indexOf("head") !== -1 && low.indexOf("headlook") === -1 &&
+                  low.indexOf("top") === -1 && low.indexOf("end") === -1) {
+                setSlot(0, cur, 4);
               } else if (low.indexOf("spine2") !== -1 || low.indexOf("spine_02") !== -1 ||
                          low.indexOf("spine_03") !== -1 || low.indexOf("upperchest") !== -1 ||
                          low.indexOf("chest") !== -1 || low.indexOf("thorax") !== -1) {
@@ -1452,25 +1449,7 @@
         P[i] = { x: bx, y: by, z: bz };
       }
 
-      // 1) If upper limb transforms (3,5,7,9) are ragdoll chunk centers instead of joint pivots,
-      //    shift them back along the upper-limb collider axis to the true Shoulder / Hip corner
-      var upperPairs = [[7, 8], [9, 10], [3, 4], [5, 6]];
-      for (var up = 0; up < upperPairs.length; up++) {
-        var uIdx = upperPairs[up][0], mIdx = upperPairs[up][1];
-        if (P[uIdx] && P[mIdx] && skel.slotPrio[uIdx] <= 1 && skel.slotCols[uIdx]) {
-          var ux = P[mIdx].x - P[uIdx].x, uy = P[mIdx].y - P[uIdx].y, uz = P[mIdx].z - P[uIdx].z;
-          var ul = Math.sqrt(ux * ux + uy * uy + uz * uz);
-          if (ul > 0.05) {
-            var bdx = -ux / ul, bdy = -uy / ul, bdz = -uz / ul;
-            var back = readColSupportDist(skel.slotCols[uIdx], P[uIdx], bdx, bdy, bdz, colBuf);
-            if (back > 0.05 && back < 0.28) {
-              P[uIdx] = { x: P[uIdx].x + bdx * back, y: P[uIdx].y + bdy * back, z: P[uIdx].z + bdz * back };
-            }
-          }
-        }
-      }
-
-      // 2) Ensure natural shoulder & hip breadth if DeadBody*Pos markers were inset near spine
+      // 1) Ensure natural shoulder & hip breadth if DeadBody*Pos markers were inset near spine
       if (P[7] && P[9]) {
         var sx = P[7].x - P[9].x, sy = P[7].y - P[9].y, sz = P[7].z - P[9].z;
         var sDist = Math.sqrt(sx * sx + sy * sy + sz * sz);
@@ -1502,7 +1481,7 @@
         }
       }
 
-      // 3) Spine hubs: Clavicle (shoulder level) & Pelvis (hip level)
+      // 2) Clean Poxel-style 2-hub spine: shoulderHub (between shoulders) & pelvisHub (between hips)
       var shoulderMid = (P[7] && P[9])
         ? { x: (P[7].x + P[9].x) * 0.5, y: (P[7].y + P[9].y) * 0.5, z: (P[7].z + P[9].z) * 0.5 }
         : null;
@@ -1510,33 +1489,44 @@
         ? { x: (P[3].x + P[5].x) * 0.5, y: (P[3].y + P[5].y) * 0.5, z: (P[3].z + P[5].z) * 0.5 }
         : null;
 
-      var chestPt = P[1] || shoulderMid;
-      var claviclePt = chestPt;
-      if (shoulderMid && chestPt) {
-        claviclePt = {
-          x: (chestPt.x + shoulderMid.x) * 0.5,
-          y: Math.max(chestPt.y, shoulderMid.y),
-          z: (chestPt.z + shoulderMid.z) * 0.5
-        };
-      }
-      var pelvisPt = P[2] || hipMid || chestPt;
-      if (hipMid && P[2] && P[2].y > hipMid.y + 0.12) {
-        pelvisPt = hipMid;
+      var shoulderHub = shoulderMid || P[1];
+      var pelvisPt = hipMid || P[2] || shoulderHub;
+
+      // 3) Single straight Head segment (shoulderHub -> headPt):
+      //    Derived strictly from real P[0] Transform (never AABB span.headX/Z, so zero kinks/snaps),
+      //    clamped to natural Poxel eye/head-center height (~11-13% of charH above shoulders).
+      var headPt = null;
+      if (shoulderHub) {
+        var minNeckY = charH * 0.10;
+        var maxNeckY = charH * 0.135;
+        var maxAbsHeadY = topY - charH * 0.105;
+        var vx = P[0] ? (P[0].x - shoulderHub.x) : 0;
+        var vy = P[0] ? (P[0].y - shoulderHub.y) : (charH * 0.115);
+        var vz = P[0] ? (P[0].z - shoulderHub.z) : 0;
+
+        if (vy < minNeckY) vy = minNeckY;
+        if (vy > maxNeckY) vy = maxNeckY;
+        if (shoulderHub.y + vy > maxAbsHeadY) {
+          vy = Math.max(charH * 0.06, maxAbsHeadY - shoulderHub.y);
+        }
+
+        // Prevent HeadLookController pitch/twist from jutting the head sideways/forward like a broken neck
+        var hHoriz = Math.sqrt(vx * vx + vz * vz);
+        var maxHoriz = Math.max(0.02, vy * 0.42);
+        if (hHoriz > maxHoriz) {
+          var hs = maxHoriz / hHoriz;
+          vx *= hs;
+          vz *= hs;
+        }
+        headPt = { x: shoulderHub.x + vx, y: shoulderHub.y + vy, z: shoulderHub.z + vz };
+      } else {
+        headPt = P[0];
       }
 
-      // 4) Full-height Head Crown reaching the top of the real Head collider (getHitboxSpan)
-      var headBasePt = P[0];
-      var crownY = topY - charH * 0.055;
-      var headCrownPt = {
-        x: (span && span.hasHead) ? span.headX : (headBasePt ? headBasePt.x : px),
-        y: headBasePt ? Math.max(headBasePt.y, crownY) : crownY,
-        z: (span && span.hasHead) ? span.headZ : (headBasePt ? headBasePt.z : pz)
-      };
-
-      // 5) Full-length Hands & Feet endpoints (matching real hitbox span from head to feetY)
+      // 4) Full-length Hands & Feet endpoints (matching real hitbox span from head to feetY)
       function resolveArmTip(uPt, mPt, hPt, colW) {
         if (!mPt) return null;
-        var ref = uPt || claviclePt || mPt;
+        var ref = uPt || shoulderHub || mPt;
         var ax = mPt.x - ref.x, ay = mPt.y - ref.y, az = mPt.z - ref.z;
         var al = Math.sqrt(ax * ax + ay * ay + az * az);
         var dx = al > 0.04 ? ax / al : 0;
@@ -1587,32 +1577,21 @@
       var lFootTip = resolveLegTip(P[3], P[4], P[11], skel.slotCols[11] || skel.slotCols[4]);
       var rFootTip = resolveLegTip(P[5], P[6], P[12], skel.slotCols[12] || skel.slotCols[6]);
 
-      // 6) Batch-project unique 3D joints and stroke crisp skeleton lines
+      // 5) Batch-project 3D segments and stroke crisp skeleton lines
       var worldSegs = [];
       function pushSeg(a, b) { if (a && b) worldSegs.push([a, b]); }
 
-      // Spine -> Neck -> HeadCrown
-      if (pelvisPt && chestPt && (Math.abs(pelvisPt.y - chestPt.y) > 0.03)) pushSeg(pelvisPt, chestPt);
-      if (chestPt && claviclePt && (Math.abs(claviclePt.y - chestPt.y) > 0.03)) pushSeg(chestPt, claviclePt);
-      else if (pelvisPt && claviclePt && (!chestPt || Math.abs(pelvisPt.y - chestPt.y) <= 0.03)) pushSeg(pelvisPt, claviclePt);
+      // Single clean Spine (pelvis -> shoulderHub) + single straight Head bone (shoulderHub -> headPt)
+      pushSeg(pelvisPt, shoulderHub);
+      pushSeg(shoulderHub, headPt);
 
-      var neckAnchor = claviclePt || chestPt;
-      if (neckAnchor) {
-        if (headBasePt && (headCrownPt.y - headBasePt.y) > 0.08 && (headBasePt.y > neckAnchor.y - 0.02)) {
-          pushSeg(neckAnchor, headBasePt);
-          pushSeg(headBasePt, headCrownPt);
-        } else {
-          pushSeg(neckAnchor, headCrownPt);
-        }
-      }
-
-      // Left Arm: Clavicle -> Shoulder -> Elbow -> Hand
-      pushSeg(neckAnchor, P[7]);
+      // Left Arm: ShoulderHub -> Shoulder -> Elbow -> Hand
+      pushSeg(shoulderHub, P[7]);
       pushSeg(P[7], P[8]);
       pushSeg(P[8], lHandTip);
 
-      // Right Arm: Clavicle -> Shoulder -> Elbow -> Hand
-      pushSeg(neckAnchor, P[9]);
+      // Right Arm: ShoulderHub -> Shoulder -> Elbow -> Hand
+      pushSeg(shoulderHub, P[9]);
       pushSeg(P[9], P[10]);
       pushSeg(P[10], rHandTip);
 
