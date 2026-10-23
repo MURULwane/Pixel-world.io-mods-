@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name        PW Box + Skeleton ESP + Aimlock + God Mode
-// @version     2.3.0
+// @version     2.3.1
 // @match       *://pixelwarfare.io/*
 // @match       *://www.pixelwarfare.io/*
 // @match       *://games.crazygames.com/*/pixel-warfare/*
@@ -30,7 +30,8 @@
   var playerMap = {};
   var nameCache = {};          // actorNr -> resolved nickname (Photon NickName, once per actor)
   var teamCache = {};          // gcPtr raw -> { team: string, ts: number } from gd.playerTeam @0xC8
-  var skelCache = {};          // gcPtr raw -> { nodes: Array, links: Array, ts: number } bone cache
+  var skelCache = {};          // gcPtr raw -> cached rig/bone transforms + colliders (3s TTL)
+  var gdCache = {};            // gcPtr raw -> gd (PlayerNetwork) ValueWrapper for Character/shoulders
   var _reusableBufs = {};
   var _spanDebugOnce = false;
 
@@ -967,38 +968,33 @@
   }
 
   // ============================================================
-  // Skeleton ESP — Poxel BONE_LINKS + cached Transform pattern
-  // adapted strictly to Pixel Warfare's gc rig in dump.cs:
-  //   Tier 1: gc.DeadBody*Pos Transform fields (@0x40..0x68)
-  //   Tier 2: gc.hitBoxes (@0xE8) Collider Transform hierarchy
+  // Skeleton ESP — Full-Size Rig + Hitbox-Span Extremity Solver
+  // Adapted strictly to Pixel Warfare's dump.cs classes:
+  //   1) Real character Transform hierarchy under gd.Character (@0x28),
+  //      gd.shoulderL/R (@0x7C/@0x78), and Object.get_name (0x4D1)
+  //   2) gc.DeadBody*Pos (@0x40..0x68) + ExplosionHit* (@0x2C..0x34)
+  //   3) gc.hitBoxes (@0xE8) Collider.get_bounds + full hitbox-span
+  //      extremity extension (Head crown, Hands, Feet at feetY) so the
+  //      skeleton always fills the full character box height & width.
   // ============================================================
   var PW_BONE_OFFSETS = [
-    0x40, // 0: DeadBodyHeadPos       (Head)
+    0x40, // 0: DeadBodyHeadPos       (Head / Neck)
     0x44, // 1: DeadBodyTopPos        (Spine2 / Upper Chest)
     0x48, // 2: DeadBodyBottomPos     (Spine1 / Pelvis)
-    0x4C, // 3: DeadBodyLLegTopPos    (Left Hip)
-    0x50, // 4: DeadBodyLLegBottomPos (Left Foot / Shin)
-    0x54, // 5: DeadBodyRLegTopPos    (Right Hip)
-    0x58, // 6: DeadBodyRLegBottomPos (Right Foot / Shin)
-    0x5C, // 7: DeadBodyLArmTopPos    (Left Shoulder)
-    0x60, // 8: DeadBodyLArmBottomPos (Left Hand / Forearm)
-    0x64, // 9: DeadBodyRArmTopPos    (Right Shoulder)
-    0x68  // 10: DeadBodyRArmBottomPos (Right Hand / Forearm)
+    0x4C, // 3: DeadBodyLLegTopPos    (Left Hip / Thigh)
+    0x50, // 4: DeadBodyLLegBottomPos (Left Knee / Shin)
+    0x54, // 5: DeadBodyRLegTopPos    (Right Hip / Thigh)
+    0x58, // 6: DeadBodyRLegBottomPos (Right Knee / Shin)
+    0x5C, // 7: DeadBodyLArmTopPos    (Left Shoulder / UpperArm)
+    0x60, // 8: DeadBodyLArmBottomPos (Left Elbow / Forearm)
+    0x64, // 9: DeadBodyRArmTopPos    (Right Shoulder / UpperArm)
+    0x68  // 10: DeadBodyRArmBottomPos (Right Elbow / Forearm)
   ];
-
-  // Exact 10-link Poxel humanoid skeleton topology
-  var PW_BONE_LINKS = [
-    [2, 1],  // Spine1 -> Spine2
-    [1, 0],  // Spine2 -> Head
-    [1, 9],  // Spine2 -> RightShoulder
-    [9, 10], // RightShoulder -> RightHand
-    [1, 7],  // Spine2 -> LeftShoulder
-    [7, 8],  // LeftShoulder -> LeftHand
-    [2, 5],  // Spine1 -> RightHip
-    [5, 6],  // RightHip -> RightFoot
-    [2, 3],  // Spine1 -> LeftHip
-    [3, 4]   // LeftHip -> LeftFoot
-  ];
+  // Canonical slots 0..14:
+  //   0: head, 1: chest, 2: pelvis,
+  //   3: lLeg1 (hip), 4: lLeg2 (knee), 5: rLeg1 (hip), 6: rLeg2 (knee),
+  //   7: lArm1 (shoulder), 8: lArm2 (elbow), 9: rArm1 (shoulder), 10: rArm2 (elbow),
+  //   11: lFoot (ankle/foot), 12: rFoot (ankle/foot), 13: lHand (wrist/hand), 14: rHand (wrist/hand)
 
   var _skelDebugOnce = false;
 
@@ -1010,9 +1006,55 @@
     var by = pb.readField(0x4, "f32").val();
     var bz = pb.readField(0x8, "f32").val();
     if (!isFinite(bx) || !isFinite(by) || !isFinite(bz)) return null;
-    if (Math.abs(bx - px) > 2.0 || Math.abs(bz - pz) > 2.0) return null;
-    if (by < py - 1.0 || by > py + 2.8) return null;
+    if (Math.abs(bx - px) > 2.2 || Math.abs(bz - pz) > 2.2) return null;
+    if (by < py - 1.0 || by > py + 2.9) return null;
     return { x: bx, y: by, z: bz };
+  }
+
+  function safeObjName(objW) {
+    try {
+      var sPtr = ctx.call("UnityEngine.Object", "get_name", [objW]);
+      if (sPtr && sPtr.val() !== 0) return sPtr.mstr() || "";
+    } catch(e) {}
+    return "";
+  }
+
+  function detectBoneSide(rawName) {
+    if (!rawName) return "";
+    if (/(\bleft|left\b|bip01\s*l\b|[_\.\s-]l[_\.\s-\d]|l_|\bl(arm|forearm|hand|upleg|leg|calf|thigh|foot|toe|shoulder|clavicle)|^(larm|lforearm|lhand|lleg|lfoot))/i.test(rawName) ||
+        /[_\.\s-]l$/i.test(rawName)) {
+      return "L";
+    }
+    if (/(\bright|right\b|bip01\s*r\b|[_\.\s-]r[_\.\s-\d]|r_|\br(arm|forearm|hand|upleg|leg|calf|thigh|foot|toe|shoulder|clavicle)|^(rarm|rforearm|rhand|rleg|rfoot))/i.test(rawName) ||
+        /[_\.\s-]r$/i.test(rawName)) {
+      return "R";
+    }
+    return "";
+  }
+
+  function isIgnoredRigBranch(lowName) {
+    if (!lowName) return false;
+    return (
+      lowName.indexOf("weapon") !== -1 ||
+      lowName.indexOf("gun") !== -1 ||
+      lowName.indexOf("rifle") !== -1 ||
+      lowName.indexOf("pistol") !== -1 ||
+      lowName.indexOf("knife") !== -1 ||
+      lowName.indexOf("grenade") !== -1 ||
+      lowName.indexOf("rocket") !== -1 ||
+      lowName.indexOf("muzzle") !== -1 ||
+      lowName.indexOf("deadbody") !== -1 ||
+      lowName.indexOf("explosionhit") !== -1 ||
+      lowName.indexOf("indicator") !== -1 ||
+      lowName.indexOf("particle") !== -1 ||
+      lowName.indexOf("camera") !== -1 ||
+      lowName.indexOf("looktarget") !== -1 ||
+      lowName.indexOf("audio") !== -1 ||
+      lowName.indexOf("overhead") !== -1 ||
+      lowName.indexOf("playername") !== -1 ||
+      lowName.indexOf("canvas") !== -1 ||
+      lowName.indexOf("shadow") !== -1
+    );
   }
 
   function resolveSkeleton(gcPtr, rootTrPtr, px, py, pz) {
@@ -1021,113 +1063,225 @@
     var cached = skelCache[gcRaw];
     // Poxel caching pattern: 3000ms TTL when valid, 1000ms retry when empty
     if (cached) {
-      var ttl = cached.links.length > 0 ? 3000 : 1000;
+      var ttl = cached.valid ? 3000 : 1000;
       if ((now - cached.ts) < ttl) return cached;
     }
 
-    var rootAddr = (rootTrPtr && rootTrPtr.val) ? rootTrPtr.val() : 0;
+    var slots = new Array(15);
+    var slotPrio = new Array(15);
+    var slotCols = new Array(15);
+    for (var z = 0; z < 15; z++) { slots[z] = null; slotPrio[z] = 0; slotCols[z] = null; }
 
-    // --- Tier 1: Direct gc.DeadBody*Pos Transform fields (@0x40..0x68) ---
+    function setSlot(idx, trW, prio) {
+      if (!trW || trW.val() === 0) return;
+      if (prio < slotPrio[idx] || (prio === slotPrio[idx] && slots[idx])) return;
+      if (!readBonePosInBand(trW, px, py, pz)) return;
+      slots[idx] = trW;
+      slotPrio[idx] = prio;
+    }
+
+    // 1) Seed baseline joints 0..10 from gc.DeadBody*Pos (@0x40..0x68) + ExplosionHit* (@0x2C..0x34)
     try {
-      var slots = new Array(11);
-      var slotPos = new Array(11);
-      var altOffsets = { 0: 0x2C, 1: 0x30, 2: 0x34 }; // ExplosionHitTop/Middle/Bottom fallbacks
+      var altOffsets = { 0: 0x2C, 1: 0x30, 2: 0x34 };
       for (var s = 0; s < 11; s++) {
         var tw = gcPtr.readField(PW_BONE_OFFSETS[s], "i32");
-        var tp = readBonePosInBand(tw, px, py, pz);
-        if (!tp && (s in altOffsets)) {
-          tw = gcPtr.readField(altOffsets[s], "i32");
-          tp = readBonePosInBand(tw, px, py, pz);
-        }
-        if (tp) {
-          slots[s] = tw;
-          slotPos[s] = tp;
-        } else {
-          slots[s] = null;
-          slotPos[s] = null;
+        setSlot(s, tw, 1);
+        if (!slots[s] && (s in altOffsets)) {
+          setSlot(s, gcPtr.readField(altOffsets[s], "i32"), 1);
         }
       }
+    } catch(eSeed) {}
 
-      // If Pelvis (2) is missing on a skin but Upper Chest (1) exists, anchor hips to (1)
-      var nodes = [];
-      var slotToNode = {};
-      var addrSeen = {};
-      for (var s2 = 0; s2 < 11; s2++) {
-        if (!slots[s2]) continue;
-        var addr = slots[s2].val();
-        if (addr in addrSeen) {
-          slotToNode[s2] = addrSeen[addr];
-        } else {
-          var idx = nodes.length;
-          nodes.push({ tr: slots[s2], col: null });
-          addrSeen[addr] = idx;
-          slotToNode[s2] = idx;
-        }
-      }
+    // 2) Upgrade to real animated Biped / Character rig transforms under gd.Character (@0x28) or rootTrPtr
+    var charRoot = rootTrPtr;
+    var gdW = gdCache[gcRaw];
+    if (gdW && gdW.val() !== 0) {
+      try {
+        var chTr = gdW.readField(0x28, "i32"); // gd.Character
+        if (chTr && chTr.val() !== 0) charRoot = chTr;
+        var shR = gdW.readField(0x78, "i32");  // gd.shoulderR
+        var shL = gdW.readField(0x7C, "i32");  // gd.shoulderL
+        setSlot(9, shR, 2);
+        setSlot(7, shL, 2);
+      } catch(eGd) {}
+    }
 
-      if (nodes.length >= 5) {
-        var links = [];
-        var linkSeen = {};
-        function addTier1Link(aSlot, bSlot) {
-          if (!(aSlot in slotToNode) || !(bSlot in slotToNode)) return;
-          var ia = slotToNode[aSlot], ib = slotToNode[bSlot];
-          if (ia === ib) return;
-          var pa = slotPos[aSlot], pb2 = slotPos[bSlot];
-          var ddx = pa.x - pb2.x, ddy = pa.y - pb2.y, ddz = pa.z - pb2.z;
-          var d2 = ddx * ddx + ddy * ddy + ddz * ddz;
-          if (d2 < 0.0009 || d2 > 2.89) return; // 0.03m .. 1.7m sanity
-          var key = ia < ib ? (ia + ":" + ib) : (ib + ":" + ia);
-          if (linkSeen[key]) return;
-          linkSeen[key] = true;
-          links.push([ia, ib]);
-        }
+    try {
+      if (charRoot && charRoot.val() !== 0) {
+        var queue = [{ tr: charRoot, depth: 0 }];
+        var visited = 0;
+        while (queue.length > 0 && visited < 90) {
+          var item = queue.shift();
+          visited++;
+          var cur = item.tr;
+          var nm = safeObjName(cur);
+          var low = nm.toLowerCase();
 
-        for (var li = 0; li < PW_BONE_LINKS.length; li++) {
-          var u = PW_BONE_LINKS[li][0], v = PW_BONE_LINKS[li][1];
-          if (u === 2 && !(2 in slotToNode) && (1 in slotToNode) && v !== 1) u = 1;
-          addTier1Link(u, v);
-        }
+          if (item.depth > 0 && isIgnoredRigBranch(low)) continue;
 
-        // Extend distal limb bones (4, 6, 8, 10) to GetChild(0) if rig uses 2-bone+tip chains
-        var distalSlots = [4, 6, 8, 10];
-        for (var di = 0; di < distalSlots.length; di++) {
-          var ds = distalSlots[di];
-          if (!(ds in slotToNode)) continue;
-          try {
-            var dTr = slots[ds];
-            var cc = ctx.call("UnityEngine.Transform", "get_childCount", [dTr]);
-            if (cc && cc.val() > 0) {
-              var chTr = ctx.call("UnityEngine.Transform", "GetChild", [dTr, 0]);
-              if (chTr && chTr.val() !== 0 && !(chTr.val() in addrSeen)) {
-                var cp = readBonePosInBand(chTr, px, py, pz);
-                if (cp) {
-                  var dp = slotPos[ds];
-                  var cdx = cp.x - dp.x, cdy = cp.y - dp.y, cdz = cp.z - dp.z;
-                  var cd = Math.sqrt(cdx * cdx + cdy * cdy + cdz * cdz);
-                  if (cd >= 0.12 && cd <= 0.60) {
-                    var cIdx = nodes.length;
-                    nodes.push({ tr: chTr, col: null });
-                    addrSeen[chTr.val()] = cIdx;
-                    links.push([slotToNode[ds], cIdx]);
-                  }
+          if (item.depth > 0 &&
+              low.indexOf("twist") === -1 && low.indexOf("roll") === -1 &&
+              low.indexOf("collider") === -1 && low.indexOf("hitbox") === -1 &&
+              low.indexOf("mesh") === -1) {
+            var bPos = readBonePosInBand(cur, px, py, pz);
+            if (bPos) {
+              var side = detectBoneSide(nm);
+              // Spine / Head / Pelvis
+              if (low.indexOf("head") !== -1 && low.indexOf("headlook") === -1) {
+                if (low.indexOf("top") !== -1 || low.indexOf("end") !== -1) setSlot(0, cur, 5);
+                else setSlot(0, cur, 4);
+              } else if (low.indexOf("neck") !== -1) {
+                setSlot(1, cur, 4);
+              } else if (low.indexOf("spine2") !== -1 || low.indexOf("spine_02") !== -1 ||
+                         low.indexOf("spine_03") !== -1 || low.indexOf("upperchest") !== -1 ||
+                         low.indexOf("chest") !== -1 || low.indexOf("thorax") !== -1) {
+                setSlot(1, cur, 3);
+              } else if (low.indexOf("pelvis") !== -1 || low.indexOf("hips") !== -1 ||
+                         low === "hip" || low.indexOf("bip01 pelvis") !== -1) {
+                setSlot(2, cur, 4);
+              } else if (low.indexOf("spine") !== -1 && Math.abs(bPos.y - py) > 0.25) {
+                setSlot(2, cur, 2);
+              }
+
+              // Side-specific Arm & Leg chains
+              if (side === "L" || side === "R") {
+                var isL = (side === "L");
+                // Hands (13 / 14) — exclude individual finger phalanges beyond wrist/hand
+                if ((low.indexOf("hand") !== -1 || low.indexOf("wrist") !== -1 || low.indexOf("palm") !== -1) &&
+                    low.indexOf("thumb") === -1 && low.indexOf("index") === -1 &&
+                    low.indexOf("middle") === -1 && low.indexOf("ring") === -1 &&
+                    low.indexOf("pinky") === -1 && low.indexOf("finger") === -1) {
+                  setSlot(isL ? 13 : 14, cur, 4);
+                } else if (low.indexOf("forearm") !== -1 || low.indexOf("lowerarm") !== -1 ||
+                           low.indexOf("lowarm") !== -1 || low.indexOf("elbow") !== -1 ||
+                           low.indexOf("arm2") !== -1) {
+                  setSlot(isL ? 8 : 10, cur, 4);
+                } else if (low.indexOf("upperarm") !== -1 || low.indexOf("uparm") !== -1 ||
+                           low.indexOf("arm1") !== -1 ||
+                           (low.indexOf("arm") !== -1 && low.indexOf("fore") === -1 && low.indexOf("low") === -1)) {
+                  setSlot(isL ? 7 : 9, cur, 4);
+                } else if (low.indexOf("shoulder") !== -1 || low.indexOf("clavicle") !== -1) {
+                  setSlot(isL ? 7 : 9, cur, 2);
+                } else if (low.indexOf("foot") !== -1 || low.indexOf("ankle") !== -1 || low.indexOf("heel") !== -1) {
+                  setSlot(isL ? 11 : 12, cur, 4);
+                } else if (low.indexOf("toe") !== -1 || low.indexOf("ball") !== -1) {
+                  setSlot(isL ? 11 : 12, cur, 3);
+                } else if (low.indexOf("calf") !== -1 || low.indexOf("shin") !== -1 ||
+                           low.indexOf("lowerleg") !== -1 || low.indexOf("lowleg") !== -1 ||
+                           low.indexOf("knee") !== -1 || low.indexOf("leg2") !== -1) {
+                  setSlot(isL ? 4 : 6, cur, 4);
+                } else if (low.indexOf("thigh") !== -1 || low.indexOf("upleg") !== -1 ||
+                           low.indexOf("upperleg") !== -1 || low.indexOf("leg1") !== -1) {
+                  setSlot(isL ? 3 : 5, cur, 4);
+                } else if (low.indexOf("leg") !== -1) {
+                  // Disambiguate generic "Leg" by whether Hip slot is already filled above it
+                  var hipSlot = isL ? 3 : 5;
+                  var kneeSlot = isL ? 4 : 6;
+                  if (!slots[hipSlot] || slotPrio[hipSlot] < 3) setSlot(hipSlot, cur, 3);
+                  else setSlot(kneeSlot, cur, 3);
                 }
               }
             }
-          } catch(eChild) {}
-        }
-
-        if (links.length >= 4) {
-          if (espConfig.debug && !_skelDebugOnce) {
-            _skelDebugOnce = true;
-            console.log("[PW ESP] Skeleton resolved via Tier 1 (DeadBody*Pos): nodes=" + nodes.length + ", links=" + links.length);
           }
-          skelCache[gcRaw] = { nodes: nodes, links: links, ts: now };
-          return skelCache[gcRaw];
+
+          if (item.depth < 8) {
+            try {
+              var cc = ctx.call("UnityEngine.Transform", "get_childCount", [cur]);
+              var nCh = cc ? cc.val() : 0;
+              if (nCh > 0 && nCh <= 24) {
+                for (var ci = 0; ci < nCh; ci++) {
+                  var ch = ctx.call("UnityEngine.Transform", "GetChild", [cur, ci]);
+                  if (ch && ch.val() !== 0) queue.push({ tr: ch, depth: item.depth + 1 });
+                }
+              }
+            } catch(eCh) {}
+          }
         }
       }
-    } catch(e1) {}
+    } catch(eWalk) {}
 
-    // --- Tier 2 Fallback: gc.hitBoxes (@0xE8) Collider Transform hierarchy ---
+    // 3) Pure-geometry child/sibling distal search across ALL children (0..cc-1)
+    //    Finds Foot / Hand transforms even when bone names are generic or DeadBody*Pos is a marker sibling
+    var usedAddrs = {};
+    for (var u0 = 0; u0 < 15; u0++) {
+      if (slots[u0]) usedAddrs[slots[u0].val()] = true;
+    }
+
+    function findDistalChild(topSlot, midSlot, tipSlot) {
+      if (slots[tipSlot] || !slots[midSlot]) return;
+      var midTr = slots[midSlot];
+      var midP = readBonePosInBand(midTr, px, py, pz);
+      if (!midP) return;
+      var topP = slots[topSlot] ? readBonePosInBand(slots[topSlot], px, py, pz) : null;
+      var dx = 0, dy = -1, dz = 0;
+      if (topP) {
+        var vx = midP.x - topP.x, vy = midP.y - topP.y, vz = midP.z - topP.z;
+        var vl = Math.sqrt(vx * vx + vy * vy + vz * vz);
+        if (vl > 0.04) { dx = vx / vl; dy = vy / vl; dz = vz / vl; }
+      }
+
+      var searchParents = [midTr];
+      try {
+        var par = ctx.call("UnityEngine.Transform", "get_parent", [midTr]);
+        if (par && par.val() !== 0) {
+          var parP = readBonePosInBand(par, px, py, pz);
+          if (parP) {
+            var pd2 = (parP.x - midP.x) * (parP.x - midP.x) +
+                      (parP.y - midP.y) * (parP.y - midP.y) +
+                      (parP.z - midP.z) * (parP.z - midP.z);
+            if (pd2 < 0.06) searchParents.push(par);
+          }
+        }
+      } catch(ePar) {}
+
+      var bestTr = null, bestProj = 0.08;
+      for (var sp = 0; sp < searchParents.length; sp++) {
+        try {
+          var pTr = searchParents[sp];
+          var cc2 = ctx.call("UnityEngine.Transform", "get_childCount", [pTr]);
+          var n2 = cc2 ? cc2.val() : 0;
+          if (n2 <= 0 || n2 > 16) continue;
+          for (var c2 = 0; c2 < n2; c2++) {
+            var cand = ctx.call("UnityEngine.Transform", "GetChild", [pTr, c2]);
+            if (!cand || cand.val() === 0 || usedAddrs[cand.val()]) continue;
+            var cLow = safeObjName(cand).toLowerCase();
+            if (isIgnoredRigBranch(cLow) || cLow.indexOf("collider") !== -1 || cLow.indexOf("hitbox") !== -1) continue;
+            var cp = readBonePosInBand(cand, px, py, pz);
+            if (!cp) continue;
+            var rx = cp.x - midP.x, ry = cp.y - midP.y, rz = cp.z - midP.z;
+            var rd = Math.sqrt(rx * rx + ry * ry + rz * rz);
+            if (rd < 0.10 || rd > 0.72) continue;
+            var proj = rx * dx + ry * dy + rz * dz;
+            if (proj > bestProj) { bestProj = proj; bestTr = cand; }
+          }
+        } catch(eScan) {}
+      }
+      if (bestTr) {
+        slots[tipSlot] = bestTr;
+        slotPrio[tipSlot] = 2;
+        usedAddrs[bestTr.val()] = true;
+      }
+    }
+
+    findDistalChild(3, 4, 11);  // Left Leg -> Left Foot
+    findDistalChild(5, 6, 12);  // Right Leg -> Right Foot
+    findDistalChild(7, 8, 13);  // Left Arm -> Left Hand
+    findDistalChild(9, 10, 14); // Right Arm -> Right Hand
+
+    // 4) Match gc.hitBoxes (@0xE8) Colliders onto slots 0..14 so drawSkeleton can read
+    //    exact world Collider bounds for limb tips & joint origins
+    var slotParentAddr = new Array(15);
+    for (var p0 = 0; p0 < 15; p0++) {
+      slotParentAddr[p0] = 0;
+      if (slots[p0]) {
+        try {
+          var spW = ctx.call("UnityEngine.Transform", "get_parent", [slots[p0]]);
+          if (spW && spW.val() !== 0) slotParentAddr[p0] = spW.val();
+        } catch(eSp) {}
+      }
+    }
+
+    var fallbackT2 = null;
     try {
       var listW = gcPtr.readField(0xE8, "i32");
       if (listW && listW.val() !== 0) {
@@ -1135,227 +1289,397 @@
         var listSize = listW.readField(0xC, "i32").val();
         if (itemsW && itemsW.val() !== 0 && listSize > 0) {
           var cap = itemsW.readField(0xC, "i32").val();
-          var count = Math.min(listSize, cap, 32);
-          var t2Nodes = [];
-          var t2Map = {};
-          var t2Links = [];
-          var t2EdgeSeen = {};
-
-          function ensureNode(trW, colW) {
-            var a = trW.val();
-            if (a in t2Map) {
-              var existing = t2Nodes[t2Map[a]];
-              if (colW && !existing.col) existing.col = colW;
-              return t2Map[a];
-            }
-            var ni = t2Nodes.length;
-            t2Nodes.push({ tr: trW, col: colW || null });
-            t2Map[a] = ni;
-            return ni;
-          }
-
-          function addT2Edge(ia, ib) {
-            if (ia === ib) return;
-            var k = ia < ib ? (ia + ":" + ib) : (ib + ":" + ia);
-            if (t2EdgeSeen[k]) return;
-            t2EdgeSeen[k] = true;
-            t2Links.push([ia, ib]);
-          }
-
-          var leafIndices = [];
-          var hasChildFlag = {};
-
-          for (var i = 0; i < count; i++) {
-            var hbW = itemsW.readField(0x10 + 4 * i, "i32");
+          var hbCount = Math.min(listSize, cap, 32);
+          for (var hi = 0; hi < hbCount; hi++) {
+            var hbW = itemsW.readField(0x10 + 4 * hi, "i32");
             if (!hbW || hbW.val() === 0) continue;
             var colW = hbW.readField(0x8, "i32");
             if (!colW || colW.val() === 0) continue;
-            var bTr = ctx.call("UnityEngine.Component", "get_transform", [colW]);
-            if (!bTr || bTr.val() === 0 || bTr.val() === rootAddr) continue;
-            if (!readBonePosInBand(bTr, px, py, pz)) continue;
-
-            var curIdx = ensureNode(bTr, colW);
-            leafIndices.push(curIdx);
-
-            // Walk Transform.get_parent up to rootTrPtr to connect limbs through spine/pelvis
-            var curTr = bTr;
-            var curNodeIdx = curIdx;
-            for (var hop = 0; hop < 4; hop++) {
-              var parTr = ctx.call("UnityEngine.Transform", "get_parent", [curTr]);
-              if (!parTr || parTr.val() === 0 || parTr.val() === rootAddr) break;
-              var parPos = readBonePosInBand(parTr, px, py, pz);
-              if (!parPos) break;
-              // Never link to model-container transforms (e.g. gd.Character) sitting at the floor root
-              var pdx = parPos.x - px, pdz = parPos.z - pz;
-              if (Math.abs(parPos.y - py) < 0.16 && (pdx * pdx + pdz * pdz) < 0.05) break;
-              var parIdx = ensureNode(parTr, null);
-              addT2Edge(parIdx, curNodeIdx);
-              hasChildFlag[parIdx] = true;
-              curTr = parTr;
-              curNodeIdx = parIdx;
-            }
-          }
-
-          // Flat blocky rig fallback: if limbs are direct children of a floor container
-          // (so get_parent yielded <2 links), link head/arms/legs through torso/pelvis hubs
-          if (t2Links.length < 2 && t2Nodes.length >= 4) {
-            var nPos = new Array(t2Nodes.length);
-            var minY = Infinity, maxY = -Infinity;
-            for (var np = 0; np < t2Nodes.length; np++) {
-              nPos[np] = readBonePosInBand(t2Nodes[np].tr, px, py, pz);
-              if (nPos[np]) {
-                if (nPos[np].y < minY) minY = nPos[np].y;
-                if (nPos[np].y > maxY) maxY = nPos[np].y;
-              }
-            }
-            var spanY = maxY - minY;
-            if (spanY > 0.35) {
-              var headIdx = -1, chestIdx = -1, pelvisIdx = -1;
-              var bestHeadY = -Infinity, bestChestScore = Infinity, bestPelvisScore = Infinity;
-              var targetChestY = minY + spanY * 0.68;
-              var targetPelvisY = minY + spanY * 0.32;
-              for (var q = 0; q < t2Nodes.length; q++) {
-                if (!nPos[q]) continue;
-                var r2 = (nPos[q].x - px) * (nPos[q].x - px) + (nPos[q].z - pz) * (nPos[q].z - pz);
-                if (nPos[q].y > bestHeadY && r2 < 0.12) { bestHeadY = nPos[q].y; headIdx = q; }
-                var cs = Math.abs(nPos[q].y - targetChestY) + r2 * 1.5;
-                if (cs < bestChestScore) { bestChestScore = cs; chestIdx = q; }
-                var ps = Math.abs(nPos[q].y - targetPelvisY) + r2 * 1.5;
-                if (ps < bestPelvisScore) { bestPelvisScore = ps; pelvisIdx = q; }
-              }
-              if (chestIdx !== -1) {
-                if (pelvisIdx === -1) pelvisIdx = chestIdx;
-                if (pelvisIdx !== chestIdx) addT2Edge(pelvisIdx, chestIdx);
-                if (headIdx !== -1 && headIdx !== chestIdx) addT2Edge(chestIdx, headIdx);
-                var midSplitY = minY + spanY * 0.50;
-                for (var r = 0; r < t2Nodes.length; r++) {
-                  if (!nPos[r] || r === headIdx || r === chestIdx || r === pelvisIdx) continue;
-                  addT2Edge(nPos[r].y >= midSplitY ? chestIdx : pelvisIdx, r);
-                }
-              }
-            }
-          }
-
-          // Extend leaf hitbox bones to GetChild(0) if present, else mark offset-collider tip
-          for (var li2 = 0; li2 < leafIndices.length; li2++) {
-            var lIdx = leafIndices[li2];
-            if (hasChildFlag[lIdx]) continue;
-            var lNode = t2Nodes[lIdx];
-            var extended = false;
+            var cTr = ctx.call("UnityEngine.Component", "get_transform", [colW]);
+            if (!cTr || cTr.val() === 0) continue;
+            var cAddr = cTr.val();
+            var cParAddr = 0;
             try {
-              var lcc = ctx.call("UnityEngine.Transform", "get_childCount", [lNode.tr]);
-              if (lcc && lcc.val() > 0) {
-                var lch = ctx.call("UnityEngine.Transform", "GetChild", [lNode.tr, 0]);
-                if (lch && lch.val() !== 0 && !(lch.val() in t2Map)) {
-                  var lcp = readBonePosInBand(lch, px, py, pz);
-                  var lpp = readBonePosInBand(lNode.tr, px, py, pz);
-                  if (lcp && lpp) {
-                    var ldx = lcp.x - lpp.x, ldy = lcp.y - lpp.y, ldz = lcp.z - lpp.z;
-                    var ld = Math.sqrt(ldx * ldx + ldy * ldy + ldz * ldz);
-                    if (ld >= 0.12 && ld <= 0.65) {
-                      var chIdx = ensureNode(lch, null);
-                      addT2Edge(lIdx, chIdx);
-                      extended = true;
-                    }
-                  }
-                }
+              var cpW = ctx.call("UnityEngine.Transform", "get_parent", [cTr]);
+              if (cpW && cpW.val() !== 0) cParAddr = cpW.val();
+            } catch(eCp) {}
+
+            for (var si = 0; si < 15; si++) {
+              if (!slots[si] || slotCols[si]) continue;
+              var sAddr = slots[si].val();
+              if (sAddr === cAddr || (cParAddr && sAddr === cParAddr) || (slotParentAddr[si] && slotParentAddr[si] === cAddr)) {
+                slotCols[si] = colW;
               }
-            } catch(eLeaf) {}
-
-            // Blocky limb collider whose pivot is at shoulder/hip and BoxCollider extends to hand/foot
-            if (!extended && lNode.col) {
-              lNode.useColTip = true;
             }
-          }
-
-          if (t2Links.length >= 2) {
-            if (espConfig.debug && !_skelDebugOnce) {
-              _skelDebugOnce = true;
-              console.log("[PW ESP] Skeleton resolved via Tier 2 (hitBoxes): nodes=" + t2Nodes.length + ", links=" + t2Links.length);
-            }
-            skelCache[gcRaw] = { nodes: t2Nodes, links: t2Links, ts: now };
-            return skelCache[gcRaw];
           }
         }
       }
-    } catch(e2) {}
+    } catch(eHb) {}
 
-    skelCache[gcRaw] = { nodes: [], links: [], ts: now };
+    var liveCount = 0;
+    for (var lc = 0; lc < 15; lc++) if (slots[lc]) liveCount++;
+
+    // 5) Tier 2 fallback for non-humanoid / zombie prefabs with <5 canonical slots
+    if (liveCount < 5) {
+      try {
+        var rootAddr = (rootTrPtr && rootTrPtr.val) ? rootTrPtr.val() : 0;
+        var listW2 = gcPtr.readField(0xE8, "i32");
+        if (listW2 && listW2.val() !== 0) {
+          var itemsW2 = listW2.readField(0x8, "i32");
+          var sz2 = listW2.readField(0xC, "i32").val();
+          if (itemsW2 && itemsW2.val() !== 0 && sz2 > 0) {
+            var cap2 = itemsW2.readField(0xC, "i32").val();
+            var cnt2 = Math.min(sz2, cap2, 32);
+            var t2Nodes = [], t2Map = {}, t2Links = [], t2Seen = {};
+            function addN(tW, cW) {
+              var a = tW.val();
+              if (a in t2Map) { if (cW && !t2Nodes[t2Map[a]].col) t2Nodes[t2Map[a]].col = cW; return t2Map[a]; }
+              var idx = t2Nodes.length;
+              t2Nodes.push({ tr: tW, col: cW || null });
+              t2Map[a] = idx;
+              return idx;
+            }
+            function addE(a, b) {
+              if (a === b) return;
+              var k = a < b ? (a + ":" + b) : (b + ":" + a);
+              if (t2Seen[k]) return;
+              t2Seen[k] = true;
+              t2Links.push([a, b]);
+            }
+            for (var j = 0; j < cnt2; j++) {
+              var hb2 = itemsW2.readField(0x10 + 4 * j, "i32");
+              if (!hb2 || hb2.val() === 0) continue;
+              var cl2 = hb2.readField(0x8, "i32");
+              if (!cl2 || cl2.val() === 0) continue;
+              var bt2 = ctx.call("UnityEngine.Component", "get_transform", [cl2]);
+              if (!bt2 || bt2.val() === 0 || bt2.val() === rootAddr) continue;
+              if (!readBonePosInBand(bt2, px, py, pz)) continue;
+              var ci2 = addN(bt2, cl2);
+              var curT = bt2, curI = ci2;
+              for (var h2 = 0; h2 < 4; h2++) {
+                var pT = ctx.call("UnityEngine.Transform", "get_parent", [curT]);
+                if (!pT || pT.val() === 0 || pT.val() === rootAddr) break;
+                var pp = readBonePosInBand(pT, px, py, pz);
+                if (!pp) break;
+                var pdx = pp.x - px, pdz = pp.z - pz;
+                if (Math.abs(pp.y - py) < 0.16 && (pdx * pdx + pdz * pdz) < 0.05) break;
+                var pi2 = addN(pT, null);
+                addE(pi2, curI);
+                curT = pT; curI = pi2;
+              }
+            }
+            if (t2Nodes.length >= 3) fallbackT2 = { nodes: t2Nodes, links: t2Links };
+          }
+        }
+      } catch(eT2) {}
+    }
+
+    var valid = (liveCount >= 5) || !!(fallbackT2 && fallbackT2.links.length >= 2);
+    if (espConfig.debug && valid && !_skelDebugOnce) {
+      _skelDebugOnce = true;
+      console.log("[PW ESP] Skeleton resolved: canonicalSlots=" + liveCount +
+                  ", feet=" + !!(slots[11] || slots[12]) + ", hands=" + !!(slots[13] || slots[14]));
+    }
+
+    skelCache[gcRaw] = {
+      valid: valid,
+      canonical: liveCount >= 5,
+      slots: slots,
+      slotPrio: slotPrio,
+      slotCols: slotCols,
+      t2: fallbackT2,
+      ts: now
+    };
     return skelCache[gcRaw];
   }
 
-  function drawSkeleton(gcPtr, rootTrPtr, px, py, pz, camPtr, color, thickness) {
+  function readColSupportDist(colW, origin, dx, dy, dz, colBuf) {
+    if (!colW || colW.val() === 0) return 0;
+    try {
+      colBuf.writeField(0x0, "f32", NaN);
+      ctx.call("UnityEngine.Collider", "get_bounds", [colBuf, colW]);
+      var cx = colBuf.readField(0x0, "f32").val();
+      if (cx !== cx) return 0;
+      var cy = colBuf.readField(0x4, "f32").val();
+      var cz = colBuf.readField(0x8, "f32").val();
+      var ex = colBuf.readField(0xC, "f32").val();
+      var ey = colBuf.readField(0x10, "f32").val();
+      var ez = colBuf.readField(0x14, "f32").val();
+      var projCenter = (cx - origin.x) * dx + (cy - origin.y) * dy + (cz - origin.z) * dz;
+      var halfSpan = Math.abs(dx) * ex + Math.abs(dy) * ey + Math.abs(dz) * ez;
+      var support = Math.max(projCenter * 2, projCenter + halfSpan);
+      return (isFinite(support) && support > 0.04 && support < 0.70) ? support : 0;
+    } catch(e) {
+      return 0;
+    }
+  }
+
+  function drawSkeleton(gcPtr, rootTrPtr, px, py, pz, topY, feetY, span, camPtr, color, thickness) {
     var gcRaw = gcPtr.val();
     var skel = resolveSkeleton(gcPtr, rootTrPtr, px, py, pz);
-    if (!skel || !skel.links || skel.links.length === 0) return;
+    if (!skel || !skel.valid) return;
 
-    var nLen = skel.nodes.length;
-    var proj = new Array(nLen);
     var wBuf = getBuf("skel_w", 0x1C);
-    var colBuf = null;
+    var colBuf = getBuf("skel_cb", 0x18);
+    var charH = Math.max(1.0, Math.min(2.6, topY - feetY));
 
-    for (var i = 0; i < nLen; i++) {
-      var node = skel.nodes[i];
-      if (!node.tr || node.tr.val() === 0) { delete skelCache[gcRaw]; return; }
-      var pb = getTransformPosBuf(node.tr);
-      // Poxel safety: NaN sentinel indicates destroyed Transform -> drop cache immediately
-      if (!pb) { delete skelCache[gcRaw]; return; }
-      var bx = pb.readField(0x0, "f32").val();
-      var by = pb.readField(0x4, "f32").val();
-      var bz = pb.readField(0x8, "f32").val();
-      if (!isFinite(bx) || !isFinite(by) || !isFinite(bz) ||
-          Math.abs(bx - px) > 2.0 || Math.abs(bz - pz) > 2.0 ||
-          by < py - 1.0 || by > py + 2.8) {
-        proj[i] = null;
-        continue;
-      }
-      writeVec3(wBuf, bx, by, bz);
+    function project3D(pt) {
+      if (!pt) return null;
+      writeVec3(wBuf, pt.x, pt.y, pt.z);
       var sc = worldToScreen(wBuf, camPtr);
-      proj[i] = (sc && sc.z >= 0.05) ? { sx: sc.x, sy: sc.y, wx: bx, wy: by, wz: bz, node: node } : null;
+      return (sc && sc.z >= 0.05) ? sc : null;
     }
 
+    // --- Canonical Full-Proportion Humanoid Skeleton ---
+    if (skel.canonical) {
+      var P = new Array(15);
+      for (var i = 0; i < 15; i++) {
+        var trW = skel.slots[i];
+        if (!trW) { P[i] = null; continue; }
+        if (trW.val() === 0) { delete skelCache[gcRaw]; return; }
+        var pb = getTransformPosBuf(trW);
+        // Poxel safety: NaN sentinel indicates destroyed Transform -> drop cache immediately
+        if (!pb) { delete skelCache[gcRaw]; return; }
+        var bx = pb.readField(0x0, "f32").val();
+        var by = pb.readField(0x4, "f32").val();
+        var bz = pb.readField(0x8, "f32").val();
+        if (!isFinite(bx) || !isFinite(by) || !isFinite(bz) ||
+            Math.abs(bx - px) > 2.2 || Math.abs(bz - pz) > 2.2 ||
+            by < py - 1.0 || by > py + 2.9) {
+          P[i] = null;
+          continue;
+        }
+        P[i] = { x: bx, y: by, z: bz };
+      }
+
+      // 1) If upper limb transforms (3,5,7,9) are ragdoll chunk centers instead of joint pivots,
+      //    shift them back along the upper-limb collider axis to the true Shoulder / Hip corner
+      var upperPairs = [[7, 8], [9, 10], [3, 4], [5, 6]];
+      for (var up = 0; up < upperPairs.length; up++) {
+        var uIdx = upperPairs[up][0], mIdx = upperPairs[up][1];
+        if (P[uIdx] && P[mIdx] && skel.slotPrio[uIdx] <= 1 && skel.slotCols[uIdx]) {
+          var ux = P[mIdx].x - P[uIdx].x, uy = P[mIdx].y - P[uIdx].y, uz = P[mIdx].z - P[uIdx].z;
+          var ul = Math.sqrt(ux * ux + uy * uy + uz * uz);
+          if (ul > 0.05) {
+            var bdx = -ux / ul, bdy = -uy / ul, bdz = -uz / ul;
+            var back = readColSupportDist(skel.slotCols[uIdx], P[uIdx], bdx, bdy, bdz, colBuf);
+            if (back > 0.05 && back < 0.28) {
+              P[uIdx] = { x: P[uIdx].x + bdx * back, y: P[uIdx].y + bdy * back, z: P[uIdx].z + bdz * back };
+            }
+          }
+        }
+      }
+
+      // 2) Ensure natural shoulder & hip breadth if DeadBody*Pos markers were inset near spine
+      if (P[7] && P[9]) {
+        var sx = P[7].x - P[9].x, sy = P[7].y - P[9].y, sz = P[7].z - P[9].z;
+        var sDist = Math.sqrt(sx * sx + sy * sy + sz * sz);
+        var minShW = charH * 0.21;
+        if (sDist > 0.02 && sDist < charH * 0.16) {
+          var halfAdd = (minShW - sDist) * 0.5 / sDist;
+          var ox = sx * halfAdd, oz = sz * halfAdd;
+          P[7] = { x: P[7].x + ox, y: P[7].y, z: P[7].z + oz };
+          P[9] = { x: P[9].x - ox, y: P[9].y, z: P[9].z - oz };
+          if (P[8])  P[8]  = { x: P[8].x + ox,  y: P[8].y,  z: P[8].z + oz };
+          if (P[10]) P[10] = { x: P[10].x - ox, y: P[10].y, z: P[10].z - oz };
+          if (P[13]) P[13] = { x: P[13].x + ox, y: P[13].y, z: P[13].z + oz };
+          if (P[14]) P[14] = { x: P[14].x - ox, y: P[14].y, z: P[14].z - oz };
+        }
+      }
+      if (P[3] && P[5]) {
+        var hx2 = P[3].x - P[5].x, hy2 = P[3].y - P[5].y, hz2 = P[3].z - P[5].z;
+        var hDist = Math.sqrt(hx2 * hx2 + hy2 * hy2 + hz2 * hz2);
+        var minHipW = charH * 0.11;
+        if (hDist > 0.01 && hDist < charH * 0.075) {
+          var hAdd = (minHipW - hDist) * 0.5 / hDist;
+          var hox = hx2 * hAdd, hoz = hz2 * hAdd;
+          P[3] = { x: P[3].x + hox, y: P[3].y, z: P[3].z + hoz };
+          P[5] = { x: P[5].x - hox, y: P[5].y, z: P[5].z - hoz };
+          if (P[4])  P[4]  = { x: P[4].x + hox,  y: P[4].y,  z: P[4].z + hoz };
+          if (P[6])  P[6]  = { x: P[6].x - hox,  y: P[6].y,  z: P[6].z - hoz };
+          if (P[11]) P[11] = { x: P[11].x + hox, y: P[11].y, z: P[11].z + hoz };
+          if (P[12]) P[12] = { x: P[12].x - hox, y: P[12].y, z: P[12].z - hoz };
+        }
+      }
+
+      // 3) Spine hubs: Clavicle (shoulder level) & Pelvis (hip level)
+      var shoulderMid = (P[7] && P[9])
+        ? { x: (P[7].x + P[9].x) * 0.5, y: (P[7].y + P[9].y) * 0.5, z: (P[7].z + P[9].z) * 0.5 }
+        : null;
+      var hipMid = (P[3] && P[5])
+        ? { x: (P[3].x + P[5].x) * 0.5, y: (P[3].y + P[5].y) * 0.5, z: (P[3].z + P[5].z) * 0.5 }
+        : null;
+
+      var chestPt = P[1] || shoulderMid;
+      var claviclePt = chestPt;
+      if (shoulderMid && chestPt) {
+        claviclePt = {
+          x: (chestPt.x + shoulderMid.x) * 0.5,
+          y: Math.max(chestPt.y, shoulderMid.y),
+          z: (chestPt.z + shoulderMid.z) * 0.5
+        };
+      }
+      var pelvisPt = P[2] || hipMid || chestPt;
+      if (hipMid && P[2] && P[2].y > hipMid.y + 0.12) {
+        pelvisPt = hipMid;
+      }
+
+      // 4) Full-height Head Crown reaching the top of the real Head collider (getHitboxSpan)
+      var headBasePt = P[0];
+      var crownY = topY - charH * 0.055;
+      var headCrownPt = {
+        x: (span && span.hasHead) ? span.headX : (headBasePt ? headBasePt.x : px),
+        y: headBasePt ? Math.max(headBasePt.y, crownY) : crownY,
+        z: (span && span.hasHead) ? span.headZ : (headBasePt ? headBasePt.z : pz)
+      };
+
+      // 5) Full-length Hands & Feet endpoints (matching real hitbox span from head to feetY)
+      function resolveArmTip(uPt, mPt, hPt, colW) {
+        if (!mPt) return null;
+        var ref = uPt || claviclePt || mPt;
+        var ax = mPt.x - ref.x, ay = mPt.y - ref.y, az = mPt.z - ref.z;
+        var al = Math.sqrt(ax * ax + ay * ay + az * az);
+        var dx = al > 0.04 ? ax / al : 0;
+        var dy = al > 0.04 ? ay / al : -1;
+        var dz = al > 0.04 ? az / al : 0;
+
+        if (hPt) {
+          var wx = hPt.x - mPt.x, wy = hPt.y - mPt.y, wz = hPt.z - mPt.z;
+          var wl = Math.sqrt(wx * wx + wy * wy + wz * wz);
+          if (wl > 0.04) { dx = wx / wl; dy = wy / wl; dz = wz / wl; }
+          var palm = charH * 0.045;
+          return { x: hPt.x + dx * palm, y: hPt.y + dy * palm, z: hPt.z + dz * palm };
+        }
+
+        var cSup = readColSupportDist(colW, mPt, dx, dy, dz, colBuf);
+        var kinExt = Math.min(charH * 0.22, Math.max(charH * 0.11, charH * 0.35 - al));
+        var ext = Math.max(cSup, kinExt);
+        return { x: mPt.x + dx * ext, y: mPt.y + dy * ext, z: mPt.z + dz * ext };
+      }
+
+      function resolveLegTip(uPt, mPt, fPt, colW) {
+        if (!mPt) return null;
+        var soleY = feetY + charH * 0.018;
+        if (fPt && (fPt.y - feetY) <= charH * 0.14) {
+          return { x: fPt.x, y: Math.min(fPt.y, soleY + 0.02), z: fPt.z };
+        }
+        var endPt = fPt || mPt;
+        var ref = fPt ? mPt : (uPt || pelvisPt || mPt);
+        var lx = endPt.x - ref.x, ly = endPt.y - ref.y, lz = endPt.z - ref.z;
+        var ll = Math.sqrt(lx * lx + ly * ly + lz * lz);
+        var dx = ll > 0.04 ? lx / ll : 0;
+        var dy = ll > 0.04 ? ly / ll : -1;
+        var dz = ll > 0.04 ? lz / ll : 0;
+
+        var cSup = readColSupportDist(colW, endPt, dx, dy, dz, colBuf);
+        var toSole = 0;
+        if (dy < -0.50 && endPt.y > soleY) {
+          toSole = Math.min(charH * 0.34, (endPt.y - soleY) / (-dy));
+        }
+        var kinShin = Math.min(charH * 0.28, Math.max(charH * 0.12, ll * 0.95));
+        var ext = Math.max(cSup, toSole > 0 ? toSole : kinShin);
+        ext = Math.min(charH * 0.35, Math.max(0.06, ext));
+        return { x: endPt.x + dx * ext, y: endPt.y + dy * ext, z: endPt.z + dz * ext };
+      }
+
+      var lHandTip = resolveArmTip(P[7], P[8], P[13], skel.slotCols[13] || skel.slotCols[8]);
+      var rHandTip = resolveArmTip(P[9], P[10], P[14], skel.slotCols[14] || skel.slotCols[10]);
+      var lFootTip = resolveLegTip(P[3], P[4], P[11], skel.slotCols[11] || skel.slotCols[4]);
+      var rFootTip = resolveLegTip(P[5], P[6], P[12], skel.slotCols[12] || skel.slotCols[6]);
+
+      // 6) Batch-project unique 3D joints and stroke crisp skeleton lines
+      var worldSegs = [];
+      function pushSeg(a, b) { if (a && b) worldSegs.push([a, b]); }
+
+      // Spine -> Neck -> HeadCrown
+      if (pelvisPt && chestPt && (Math.abs(pelvisPt.y - chestPt.y) > 0.03)) pushSeg(pelvisPt, chestPt);
+      if (chestPt && claviclePt && (Math.abs(claviclePt.y - chestPt.y) > 0.03)) pushSeg(chestPt, claviclePt);
+      else if (pelvisPt && claviclePt && (!chestPt || Math.abs(pelvisPt.y - chestPt.y) <= 0.03)) pushSeg(pelvisPt, claviclePt);
+
+      var neckAnchor = claviclePt || chestPt;
+      if (neckAnchor) {
+        if (headBasePt && (headCrownPt.y - headBasePt.y) > 0.08 && (headBasePt.y > neckAnchor.y - 0.02)) {
+          pushSeg(neckAnchor, headBasePt);
+          pushSeg(headBasePt, headCrownPt);
+        } else {
+          pushSeg(neckAnchor, headCrownPt);
+        }
+      }
+
+      // Left Arm: Clavicle -> Shoulder -> Elbow -> Hand
+      pushSeg(neckAnchor, P[7]);
+      pushSeg(P[7], P[8]);
+      pushSeg(P[8], lHandTip);
+
+      // Right Arm: Clavicle -> Shoulder -> Elbow -> Hand
+      pushSeg(neckAnchor, P[9]);
+      pushSeg(P[9], P[10]);
+      pushSeg(P[10], rHandTip);
+
+      // Left Leg: Pelvis -> Hip -> Knee -> Foot
+      pushSeg(pelvisPt, P[3]);
+      pushSeg(P[3], P[4]);
+      if (P[11] && lFootTip && (Math.abs(P[11].y - lFootTip.y) > 0.05)) {
+        pushSeg(P[4], P[11]);
+        pushSeg(P[11], lFootTip);
+      } else {
+        pushSeg(P[4], lFootTip);
+      }
+
+      // Right Leg: Pelvis -> Hip -> Knee -> Foot
+      pushSeg(pelvisPt, P[5]);
+      pushSeg(P[5], P[6]);
+      if (P[12] && rFootTip && (Math.abs(P[12].y - rFootTip.y) > 0.05)) {
+        pushSeg(P[6], P[12]);
+        pushSeg(P[12], rFootTip);
+      } else {
+        pushSeg(P[6], rFootTip);
+      }
+
+      ctx2d.strokeStyle = color;
+      ctx2d.lineWidth = thickness;
+      ctx2d.lineCap = "round";
+      ctx2d.beginPath();
+      var drawn = false;
+      for (var sg = 0; sg < worldSegs.length; sg++) {
+        var sa = project3D(worldSegs[sg][0]);
+        var sb = project3D(worldSegs[sg][1]);
+        if (!sa || !sb) continue;
+        ctx2d.moveTo(sa.x, sa.y);
+        ctx2d.lineTo(sb.x, sb.y);
+        drawn = true;
+      }
+      if (drawn) ctx2d.stroke();
+      ctx2d.lineCap = "butt";
+      return;
+    }
+
+    // --- Tier 2 Fallback Rendering ---
+    if (!skel.t2 || !skel.t2.links.length) return;
+    var t2N = skel.t2.nodes;
+    var proj2 = new Array(t2N.length);
+    for (var m = 0; m < t2N.length; m++) {
+      if (!t2N[m].tr || t2N[m].tr.val() === 0) { delete skelCache[gcRaw]; return; }
+      var pb2 = getTransformPosBuf(t2N[m].tr);
+      if (!pb2) { delete skelCache[gcRaw]; return; }
+      var tx = pb2.readField(0x0, "f32").val();
+      var ty = pb2.readField(0x4, "f32").val();
+      var tz = pb2.readField(0x8, "f32").val();
+      proj2[m] = project3D({ x: tx, y: ty, z: tz });
+    }
     ctx2d.strokeStyle = color;
     ctx2d.lineWidth = thickness;
     ctx2d.lineCap = "round";
     ctx2d.beginPath();
-    var anySeg = false;
-
-    for (var k = 0; k < skel.links.length; k++) {
-      var pa = proj[skel.links[k][0]];
-      var pb2 = proj[skel.links[k][1]];
-      if (!pa || !pb2) continue;
-      ctx2d.moveTo(pa.sx, pa.sy);
-      ctx2d.lineTo(pb2.sx, pb2.sy);
-      anySeg = true;
+    var any2 = false;
+    for (var k2 = 0; k2 < skel.t2.links.length; k2++) {
+      var qa = proj2[skel.t2.links[k2][0]], qb = proj2[skel.t2.links[k2][1]];
+      if (!qa || !qb) continue;
+      ctx2d.moveTo(qa.x, qa.y);
+      ctx2d.lineTo(qb.x, qb.y);
+      any2 = true;
     }
-
-    // Optional blocky-limb collider tip extensions in Tier 2
-    for (var m = 0; m < nLen; m++) {
-      var pm = proj[m];
-      if (!pm || !pm.node.useColTip || !pm.node.col) continue;
-      try {
-        if (!colBuf) colBuf = getBuf("skel_cb", 0x18);
-        colBuf.writeField(0x0, "f32", NaN);
-        ctx.call("UnityEngine.Collider", "get_bounds", [colBuf, pm.node.col]);
-        var cx = colBuf.readField(0x0, "f32").val();
-        if (cx !== cx) continue;
-        var cy = colBuf.readField(0x4, "f32").val();
-        var cz = colBuf.readField(0x8, "f32").val();
-        var ox = cx - pm.wx, oy = cy - pm.wy, oz = cz - pm.wz;
-        var od = Math.sqrt(ox * ox + oy * oy + oz * oz);
-        if (od >= 0.10 && od <= 0.48) {
-          writeVec3(wBuf, pm.wx + ox * 2, pm.wy + oy * 2, pm.wz + oz * 2);
-          var tipSc = worldToScreen(wBuf, camPtr);
-          if (tipSc && tipSc.z >= 0.05) {
-            ctx2d.moveTo(pm.sx, pm.sy);
-            ctx2d.lineTo(tipSc.x, tipSc.y);
-            anySeg = true;
-          }
-        }
-      } catch(eTip) {}
-    }
-
-    if (anySeg) ctx2d.stroke();
+    if (any2) ctx2d.stroke();
     ctx2d.lineCap = "butt";
   }
 
@@ -1807,17 +2131,18 @@
     })();
 
     // ============================================================
-    // gd.Update — cache playerTeam @0xC8 per gc instance (for Team Check)
+    // gd.Update — cache gd instance (Character/shoulders) + playerTeam @0xC8
     // ============================================================
     try {
       ctx.hookPrefix({
         typeName: "gd", methodName: "Update", params: ["i32", "i32"]
       }, function(thisPtr) {
         try {
-          if (!aimConfig.teamCheck) return;
           var gcW = thisPtr.readField(0xA8, "i32"); // gd.playerDamage -> gc
           if (!gcW || gcW.val() === 0) return;
           var gRaw = gcW.val();
+          gdCache[gRaw] = thisPtr;
+          if (!aimConfig.teamCheck) return;
           var now = Date.now();
           if (teamCache[gRaw] && (now - teamCache[gRaw].ts) < 1000) return;
           var tmPtr = thisPtr.readField(0xC8, "i32"); // gd.playerTeam -> string
@@ -1950,6 +2275,7 @@
           nameCache = {};
           teamCache = {};
           skelCache = {};
+          gdCache = {};
           return;
         }
 
@@ -1958,7 +2284,10 @@
         for (var s = 0; s < staleKeys.length; s++) {
           if (now - playerMap[staleKeys[s]].timestamp > 500) {
             var stPtr = playerMap[staleKeys[s]].ptr;
-            if (stPtr && stPtr.val) delete skelCache[stPtr.val()];
+            if (stPtr && stPtr.val) {
+              delete skelCache[stPtr.val()];
+              delete gdCache[stPtr.val()];
+            }
             delete playerMap[staleKeys[s]];
           }
         }
@@ -2022,7 +2351,7 @@
 
             // Exact box span + head collider center
             var topY = null, feetY = py, span = null;
-            if (espConfig.boxAutoHeight || aimActive) {
+            if (espConfig.boxAutoHeight || espConfig.skeleton || aimActive) {
               span = getHitboxSpan(data.ptr, py, px, pz);
               if (span && span.top > span.bottom) {
                 var rel = span.top - py;
@@ -2085,7 +2414,7 @@
               }
 
               if (espConfig.skeleton) {
-                drawSkeleton(data.ptr, trPtr, px, py, pz, camPtr, espConfig.skeletonColor, espConfig.skeletonThickness);
+                drawSkeleton(data.ptr, trPtr, px, py, pz, topY, feetY, span, camPtr, espConfig.skeletonColor, espConfig.skeletonThickness);
               }
 
               if (espConfig.name) {
