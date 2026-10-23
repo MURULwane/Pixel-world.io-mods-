@@ -114,7 +114,6 @@
   var exploitConfig = {
     godMode: false,                        // toggled with "G" key or Menu -> Player tab
     toggleKey: "g",
-    noKnockback: true,                     // block explosion/bullet pushback while in God Mode
     antiInfect: true                       // block zombie infection RPC while in God Mode
   };
 
@@ -516,7 +515,6 @@
         '<div class="hm-group">' +
           '<div class="hm-group-title">Protection</div>' +
           toggleRow("exploit", "godMode", "God Mode (" + String(exploitConfig.toggleKey).toUpperCase() + ")") +
-          toggleRow("exploit", "noKnockback", "No Hit / Blast Knockback") +
           toggleRow("exploit", "antiInfect", "Anti-Zombie Infect") +
         '</div>';
     } else if (activeTab === "Settings") {
@@ -1300,102 +1298,109 @@
     });
 
     // ============================================================
-    // GOD MODE HOOKS — Pixel Warfare dump.cs verified signatures
-    //   Only cancels damage/death on the LOCAL player (isLocalGc),
-    //   leaving damage dealt to remote enemies 100% untouched.
+    // GOD MODE TABLE HOOKS — installed directly on WebAssembly.Table
+    // AFTER wasm instantiation so:
+    //   1) wail never sees Cyrillic method names ("нараняване", "Проверка"),
+    //      avoiding Latin-1 import truncation LinkErrors.
+    //   2) Missing/renamed methods (idx <= 0) are safely skipped without
+    //      ever calling WebAssembly.Table.get(-1).
+    //   3) Only blocks calls targeting the LOCAL player (isLocalGc/isLocalGd),
+    //      leaving damage dealt to enemies 100% untouched.
     // ============================================================
-    // 1) [PunRPC] gc.нараняване (RVA 0x5C9D) — incoming network weapon/blast damage
-    try {
-      ctx.hookPrefix({
-        typeName: "gc",
-        methodName: "нараняване",
-        params: ["i32", "f32", "i32", "i32", "f32", "i32", "i32", "i32", "i32", "i32"]
-      }, function(thisPtr) {
+    function makeWasmTrampoline(params, results, jsImpl) {
+      function wasmType(t) {
+        if (t === "i32") return 0x7f;
+        if (t === "i64") return 0x7e;
+        if (t === "f32") return 0x7d;
+        if (t === "f64") return 0x7c;
+        throw new Error("Unsupported wasm type: " + t);
+      }
+      var pTypes = params.map(wasmType);
+      var rTypes = results.map(wasmType);
+      var typeVec = [0x60, pTypes.length].concat(pTypes, [rTypes.length], rTypes);
+      var typeSec = [0x01, typeVec.length + 1, 0x01].concat(typeVec);
+      var impEntry = [0x01, 0x65, 0x01, 0x66, 0x00, 0x00];
+      var impSec = [0x02, impEntry.length + 1, 0x01].concat(impEntry);
+      var expEntry = [0x01, 0x67, 0x00, 0x00];
+      var expSec = [0x07, expEntry.length + 1, 0x01].concat(expEntry);
+      var bytes = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00].concat(typeSec, impSec, expSec));
+      var mod = new WebAssembly.Module(bytes);
+      var inst = new WebAssembly.Instance(mod, { e: { f: jsImpl } });
+      return inst.exports.g;
+    }
+
+    (function installGodModeTableHooks() {
+      var attempts = 0;
+      var timer = setInterval(function() {
+        attempts++;
+        if (attempts > 240) { clearInterval(timer); return; } // 60s timeout
         try {
-          if (exploitConfig.godMode && isLocalGc(thisPtr)) return false;
+          var ug = window.unityGameInstance || window.unityInstance || (typeof game !== "undefined" ? game : null);
+          if (!ug || !ug.Module || !ug.Module.asm) return;
+          var rt = ctx && ctx._runtime;
+          if (!rt || !rt.il2CppContext || typeof rt.getTableIndex !== "function") return;
+
+          var asm = ug.Module.asm;
+          var tName = rt.tableName || (typeof rt.resolveTableName === "function" ? rt.resolveTableName(asm) : null);
+          var table = tName ? asm[tName] : null;
+          if (!table || typeof table.get !== "function") {
+            var aKeys = Object.keys(asm);
+            for (var k = 0; k < aKeys.length; k++) {
+              if (typeof WebAssembly !== "undefined" && WebAssembly.Table && asm[aKeys[k]] instanceof WebAssembly.Table) {
+                table = asm[aKeys[k]];
+                break;
+              }
+            }
+          }
+          if (!table || typeof table.get !== "function" || typeof table.set !== "function") return;
+
+          clearInterval(timer);
+
+          function hookTableVoid(typeName, methodName, params, shouldBlockFn) {
+            try {
+              var idx = rt.getTableIndex(typeName, methodName);
+              if (typeof idx !== "number" || !(idx > 0)) return false;
+              var origFn = table.get(idx);
+              if (typeof origFn !== "function") return false;
+              var tramp = makeWasmTrampoline(params, [], function() {
+                if (exploitConfig.godMode) {
+                  try {
+                    if (shouldBlockFn(arguments)) return;
+                  } catch(e) {}
+                }
+                return origFn.apply(null, arguments);
+              });
+              table.set(idx, tramp);
+              return true;
+            } catch(e) {
+              return false;
+            }
+          }
+
+          var blockLocalGc = function(args) {
+            return isLocalGc(new UnityWebModkit.ValueWrapper(args[0]));
+          };
+
+          var count = 0;
+          // Only hook NON-OBFUSCATED [PunRPC] / public methods whose names and
+          // signatures cannot be randomized across game builds:
+          // 1) [PunRPC] gc.нараняване — incoming network weapon / headshot / blast damage
+          if (hookTableVoid("gc", "нараняване", ["i32", "f32", "i32", "i32", "f32", "i32", "i32", "i32", "i32", "i32"], blockLocalGc)) count++;
+          // 2) gc.Kill(int weaponid) — instant death (lava, void, drowning, traps)
+          if (hookTableVoid("gc", "Kill", ["i32", "i32", "i32"], blockLocalGc)) count++;
+          // 3) [PunRPC] gd.InfectPlayer(int spawnId) — zombie mode infection RPC
+          if (hookTableVoid("gd", "InfectPlayer", ["i32", "i32", "i32"], function(args) {
+            return exploitConfig.antiInfect && isLocalGd(new UnityWebModkit.ValueWrapper(args[0]));
+          })) count++;
+          // 4) [PunRPC] PhotonRPC_redirect.Проверка(Player, int) — incoming death-check report RPC
+          if (hookTableVoid("PhotonRPC_redirect", "Проверка", ["i32", "i32", "i32", "i32"], function() {
+            return true;
+          })) count++;
+
+          console.log("[PW GOD] Installed " + count + " WebAssembly.Table RPC/damage hooks");
         } catch(e) {}
-      });
-    } catch(e) {}
-
-    // 2) gc.Kill + obfuscator aliases (int weaponid) — instant death (lava, void, drowning, traps)
-    ["Kill", "cne", "bil", "fax", "bpc"].forEach(function(killMethod) {
-      try {
-        ctx.hookPrefix({
-          typeName: "gc",
-          methodName: killMethod,
-          params: ["i32", "i32", "i32"]
-        }, function(thisPtr) {
-          try {
-            if (exploitConfig.godMode && isLocalGc(thisPtr)) return false;
-          } catch(e) {}
-        });
-      } catch(e) {}
-    });
-
-    // 3) gc.chc (RVA 0x5C97, float dmg) — fall / drowning / environmental damage
-    try {
-      ctx.hookPrefix({
-        typeName: "gc",
-        methodName: "chc",
-        params: ["i32", "f32", "i32"]
-      }, function(thisPtr) {
-        try {
-          if (exploitConfig.godMode && isLocalGc(thisPtr)) return false;
-        } catch(e) {}
-      });
-    } catch(e) {}
-
-    // 4) gc.che & gc.mlk (float dmg, Vector3 dir, int weaponid) — self rocket/grenade splash
-    ["che", "mlk"].forEach(function(expMethod) {
-      try {
-        ctx.hookPrefix({
-          typeName: "gc",
-          methodName: expMethod,
-          params: ["i32", "f32", "i32", "i32", "i32"]
-        }, function(thisPtr) {
-          try {
-            if (exploitConfig.godMode && isLocalGc(thisPtr)) return false;
-          } catch(e) {}
-        });
-      } catch(e) {}
-    });
-
-    // 5) gc.chg (RVA 0x5C87, Vector3 dir) — hit / blast knockback push
-    try {
-      ctx.hookPrefix({
-        typeName: "gc",
-        methodName: "chg",
-        params: ["i32", "i32", "i32"]
-      }, function(thisPtr) {
-        try {
-          if (exploitConfig.godMode && exploitConfig.noKnockback && isLocalGc(thisPtr)) return false;
-        } catch(e) {}
-      });
-    } catch(e) {}
-
-    // 6) [PunRPC] gd.InfectPlayer (RVA 0x5CBE, int spawnId) — zombie infection RPC
-    try {
-      ctx.hookPrefix({
-        typeName: "gd",
-        methodName: "InfectPlayer",
-        params: ["i32", "i32", "i32"]
-      }, function(thisPtr) {
-        try {
-          if (exploitConfig.godMode && exploitConfig.antiInfect && isLocalGd(thisPtr)) return false;
-        } catch(e) {}
-      });
-    } catch(e) {}
-
-    // 7) [PunRPC] PhotonRPC_redirect.Проверка (RVA 0x6810) — incoming death-check report RPC
-    try {
-      ctx.hookPrefix({
-        typeName: "PhotonRPC_redirect",
-        methodName: "Проверка",
-        params: ["i32", "i32", "i32", "i32"]
-      }, function() {
-        if (exploitConfig.godMode) return false;
-      });
-    } catch(e) {}
+      }, 250);
+    })();
 
     // ============================================================
     // gd.Update — cache playerTeam @0xC8 per gc instance (for Team Check)
