@@ -1185,13 +1185,54 @@
               if (!parTr || parTr.val() === 0 || parTr.val() === rootAddr) break;
               var parPos = readBonePosInBand(parTr, px, py, pz);
               if (!parPos) break;
-              // Skip container transforms parked right on the root origin (feet) unless near pelvis
-              if (Math.abs(parPos.y - py) < 0.08 && hop >= 1) break;
+              // Never link to model-container transforms (e.g. gd.Character) sitting at the floor root
+              var pdx = parPos.x - px, pdz = parPos.z - pz;
+              if (Math.abs(parPos.y - py) < 0.16 && (pdx * pdx + pdz * pdz) < 0.05) break;
               var parIdx = ensureNode(parTr, null);
               addT2Edge(parIdx, curNodeIdx);
               hasChildFlag[parIdx] = true;
               curTr = parTr;
               curNodeIdx = parIdx;
+            }
+          }
+
+          // Flat blocky rig fallback: if limbs are direct children of a floor container
+          // (so get_parent yielded <2 links), link head/arms/legs through torso/pelvis hubs
+          if (t2Links.length < 2 && t2Nodes.length >= 4) {
+            var nPos = new Array(t2Nodes.length);
+            var minY = Infinity, maxY = -Infinity;
+            for (var np = 0; np < t2Nodes.length; np++) {
+              nPos[np] = readBonePosInBand(t2Nodes[np].tr, px, py, pz);
+              if (nPos[np]) {
+                if (nPos[np].y < minY) minY = nPos[np].y;
+                if (nPos[np].y > maxY) maxY = nPos[np].y;
+              }
+            }
+            var spanY = maxY - minY;
+            if (spanY > 0.35) {
+              var headIdx = -1, chestIdx = -1, pelvisIdx = -1;
+              var bestHeadY = -Infinity, bestChestScore = Infinity, bestPelvisScore = Infinity;
+              var targetChestY = minY + spanY * 0.68;
+              var targetPelvisY = minY + spanY * 0.32;
+              for (var q = 0; q < t2Nodes.length; q++) {
+                if (!nPos[q]) continue;
+                var r2 = (nPos[q].x - px) * (nPos[q].x - px) + (nPos[q].z - pz) * (nPos[q].z - pz);
+                if (nPos[q].y > bestHeadY && r2 < 0.12) { bestHeadY = nPos[q].y; headIdx = q; }
+                var cs = Math.abs(nPos[q].y - targetChestY) + r2 * 1.5;
+                if (cs < bestChestScore) { bestChestScore = cs; chestIdx = q; }
+                var ps = Math.abs(nPos[q].y - targetPelvisY) + r2 * 1.5;
+                if (ps < bestPelvisScore) { bestPelvisScore = ps; pelvisIdx = q; }
+              }
+              if (chestIdx !== -1) {
+                if (pelvisIdx === -1) pelvisIdx = chestIdx;
+                if (pelvisIdx !== chestIdx) addT2Edge(pelvisIdx, chestIdx);
+                if (headIdx !== -1 && headIdx !== chestIdx) addT2Edge(chestIdx, headIdx);
+                var midSplitY = minY + spanY * 0.50;
+                for (var r = 0; r < t2Nodes.length; r++) {
+                  if (!nPos[r] || r === headIdx || r === chestIdx || r === pelvisIdx) continue;
+                  addT2Edge(nPos[r].y >= midSplitY ? chestIdx : pelvisIdx, r);
+                }
+              }
             }
           }
 
